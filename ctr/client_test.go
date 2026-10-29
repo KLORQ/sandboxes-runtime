@@ -133,3 +133,11 @@ func TestCapabilitiesFailClosed(t *testing.T) {
 		t.Fatalf("network capabilities must stay off: %+v", caps)
 	}
 }
+
+func TestBackendHandle(t *testing.T) {
+	backend := &Backend{fifoDir: "/tmp/fifo"}
+	handle := backend.Handle("dev")
+	if handle.ID != "klorq-dev" || handle.FIFODir != "/tmp/fifo" {
+		t.Fatalf("unexpected handle: %+v", handle)
+	}
+}

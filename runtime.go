@@ -38,4 +38,5 @@ type Backend interface {
 	Start(ctx context.Context, h Handle) error
 	Stop(ctx context.Context, h Handle, grace time.Duration) error
 	Delete(ctx context.Context, h Handle) error
+	Handle(name string) Handle
 }
