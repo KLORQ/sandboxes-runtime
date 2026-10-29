@@ -141,3 +141,44 @@ func TestBackendHandle(t *testing.T) {
 		t.Fatalf("unexpected handle: %+v", handle)
 	}
 }
+
+type fakeNetwork struct {
+	started int
+	stopped int
+}
+
+func (f *fakeNetwork) Start(context.Context, string) (runtime.NetworkAttachment, error) {
+	f.started++
+	return runtime.NetworkAttachment{Annotations: []string{"io.containerd.nerdbox.network.0=test"}}, nil
+}
+func (f *fakeNetwork) Stop(context.Context, string) error { f.stopped++; return nil }
+
+func TestBackendNetworkAnnotations(t *testing.T) {
+	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		return nil, nil
+	}}
+	client := newTestClient(t, runner)
+	network := &fakeNetwork{}
+	backend := &Backend{client: client, image: "alpine:3.22", network: network}
+	handle, err := backend.Create(context.Background(), runtime.Config{Name: "dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if network.started != 1 {
+		t.Fatalf("network starts = %d", network.started)
+	}
+	joined := strings.Join(runner.calls[len(runner.calls)-1], " ")
+	if !strings.Contains(joined, "io.containerd.nerdbox.network.0=test") {
+		t.Fatalf("missing network annotation: %s", joined)
+	}
+	caps, err := backend.Capabilities(context.Background())
+	if err != nil || !caps.Network {
+		t.Fatalf("network capability: %+v, %v", caps, err)
+	}
+	if err := backend.Stop(context.Background(), handle, 0); err != nil {
+		t.Fatal(err)
+	}
+	if network.stopped != 1 {
+		t.Fatalf("network stops = %d", network.stopped)
+	}
+}

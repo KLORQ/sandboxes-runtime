@@ -28,7 +28,8 @@ start/stop/delete, and workspace bind mounts.
 
 Current limits are explicit:
 
-- `Capabilities.Network` is `false`; gateway wiring is the next step;
+- `Capabilities.Network` is `false` unless a `runtime.Network` implementation is supplied;
+- network annotations are wired through `runtime.Network`; the daemon supplies the gateway manager;
 - no exec/PTY yet;
 - no snapshots or GPU;
 - adapter is covered by command-construction tests, not a live VM test yet.
