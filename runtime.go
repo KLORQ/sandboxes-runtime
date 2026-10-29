@@ -22,11 +22,13 @@ type Config struct {
 	Workspace string
 	CPUs      uint8
 	MemoryMiB uint32
+	FIFODir   string
 }
 
 // Handle identifies a runtime instance.
 type Handle struct {
-	ID string
+	ID      string
+	FIFODir string
 }
 
 // Backend is implemented by the containerd/nerdbox adapter.

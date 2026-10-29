@@ -1,0 +1,221 @@
+package ctr
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Runner executes ctr commands. Tests can replace it with a fake.
+type Runner interface {
+	CombinedOutput(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+type execRunner struct{}
+
+func (execRunner) CombinedOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...) // #nosec G204 -- ctr and its arguments are validated by this adapter
+	return cmd.CombinedOutput()
+}
+
+// Client wraps a pinned containerd CLI.
+type Client struct {
+	cfg    Config
+	runner Runner
+}
+
+// New creates a containerd CLI client.
+func New(cfg Config) (*Client, error) {
+	cfg, err := cfg.withDefaults()
+	if err != nil {
+		return nil, err
+	}
+	return &Client{cfg: cfg, runner: execRunner{}}, nil
+}
+
+// Config returns the effective client configuration.
+func (c *Client) Config() Config { return c.cfg }
+
+// Version checks that containerd is reachable.
+func (c *Client) Version(ctx context.Context) error {
+	_, err := c.run(ctx, "version")
+	return err
+}
+
+// EnsureImage pulls image when it is not already present.
+func (c *Client) EnsureImage(ctx context.Context, image string) error {
+	if image == "" {
+		return fmt.Errorf("image is required")
+	}
+	out, err := c.run(ctx, "images", "ls", "-q")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == image {
+			return nil
+		}
+	}
+	_, err = c.run(ctx, "images", "pull", "--platform", c.cfg.Platform, "--snapshotter", c.cfg.Snapshotter, image)
+	if err != nil {
+		return fmt.Errorf("pull %s: %w", image, err)
+	}
+	return nil
+}
+
+// ContainerExists reports whether a container exists.
+func (c *Client) ContainerExists(ctx context.Context, id string) bool {
+	out, err := c.run(ctx, "containers", "ls", "-q")
+	if err != nil {
+		return false
+	}
+	return containsLine(out, id)
+}
+
+// TaskRunning reports whether a task is running.
+func (c *Client) TaskRunning(ctx context.Context, id string) bool {
+	out, err := c.run(ctx, "tasks", "ls", "-q")
+	if err != nil {
+		return false
+	}
+	return containsLine(out, id)
+}
+
+// Mount describes a bind mount.
+type Mount struct {
+	Source      string
+	Destination string
+	ReadOnly    bool
+}
+
+// RunSpec describes a detached runtime task.
+type RunSpec struct {
+	ContainerID string
+	Name        string
+	Image       string
+	CPUs        uint8
+	MemoryMiB   uint32
+	FIFODir     string
+	Mounts      []Mount
+	Env         []string
+	Annotations []string
+	Args        []string
+}
+
+// Run creates and starts a detached container.
+func (c *Client) Run(ctx context.Context, spec RunSpec) error {
+	if spec.ContainerID == "" || spec.Image == "" {
+		return fmt.Errorf("container id and image are required")
+	}
+	if spec.CPUs == 0 {
+		spec.CPUs = 2
+	}
+	if spec.MemoryMiB == 0 {
+		spec.MemoryMiB = 1024
+	}
+	args := []string{
+		"run", "--detach",
+		"--runtime", c.cfg.Runtime,
+		"--snapshotter", c.cfg.Snapshotter,
+		"--label", "io.klorq.sandbox=" + spec.Name,
+		"--cpus", strconv.Itoa(int(spec.CPUs)),
+		"--memory-limit", strconv.FormatUint(uint64(spec.MemoryMiB)*1024*1024, 10),
+	}
+	if spec.FIFODir != "" {
+		args = append(args, "--fifo-dir", spec.FIFODir)
+	}
+	for _, annotation := range spec.Annotations {
+		args = append(args, "--annotation", annotation)
+	}
+	for _, mount := range spec.Mounts {
+		args = append(args, "--mount", mountSpec(mount))
+	}
+	for _, env := range spec.Env {
+		args = append(args, "--env", env)
+	}
+	args = append(args, spec.Image, spec.ContainerID)
+	if len(spec.Args) == 0 {
+		args = append(args, "/bin/sh", "-c", "trap 'exit 0' TERM INT; while :; do sleep 3600; done")
+	} else {
+		args = append(args, spec.Args...)
+	}
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// StartTask starts a stopped task.
+func (c *Client) StartTask(ctx context.Context, id, fifoDir string) error {
+	args := []string{"tasks", "start", "-d"}
+	if fifoDir != "" {
+		args = append(args, "--fifo-dir", fifoDir)
+	}
+	args = append(args, id)
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// StopTask terminates a task and waits for the grace period.
+func (c *Client) StopTask(ctx context.Context, id string, grace time.Duration) error {
+	if !c.TaskRunning(ctx, id) {
+		_, _ = c.run(ctx, "tasks", "delete", "-f", id)
+		return nil
+	}
+	_, _ = c.run(ctx, "tasks", "kill", "-s", "SIGTERM", id)
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		if !c.TaskRunning(ctx, id) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if c.TaskRunning(ctx, id) {
+		_, _ = c.run(ctx, "tasks", "kill", "-s", "SIGKILL", id)
+	}
+	_, _ = c.run(ctx, "tasks", "delete", "-f", id)
+	return nil
+}
+
+// DeleteTask removes a task if present.
+func (c *Client) DeleteTask(ctx context.Context, id string) error {
+	_, err := c.run(ctx, "tasks", "delete", "-f", id)
+	return err
+}
+
+// DeleteContainer removes a container.
+func (c *Client) DeleteContainer(ctx context.Context, id string) error {
+	_, err := c.run(ctx, "containers", "delete", id)
+	return err
+}
+
+func (c *Client) run(ctx context.Context, args ...string) (string, error) {
+	full := append([]string{"--address", c.cfg.Socket, "--namespace", c.cfg.Namespace}, args...)
+	out, err := c.runner.CombinedOutput(ctx, c.cfg.CTR, full...)
+	if err != nil {
+		return string(out), fmt.Errorf("%s %s: %w: %s", c.cfg.CTR, strings.Join(full, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+func containsLine(out, want string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func mountSpec(m Mount) string {
+	options := "rbind:rw"
+	if m.ReadOnly {
+		options = "rbind:ro"
+	}
+	return fmt.Sprintf("type=bind,src=%s,dst=%s,options=%s", m.Source, m.Destination, options)
+}
