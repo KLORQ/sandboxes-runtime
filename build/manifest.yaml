@@ -1,0 +1,31 @@
+version: 1
+platforms:
+  - darwin/arm64
+  - linux/arm64
+components:
+  containerd:
+    version: "2.4.2"
+    source: https://github.com/containerd/containerd
+  nerdbox:
+    version: "0.2.5"
+    commit: 28c86e8e16c62a08079531ebe99e24a7bdad3d62
+    source: https://github.com/containerd/nerdbox
+  libkrun:
+    version: "1.19.6"
+    source: https://github.com/containers/libkrun
+  gvisor-tap-vsock:
+    commit: 1cd3f0426b07b3a683d47c671edff8ca261225db
+    source: https://github.com/containers/gvisor-tap-vsock
+patches:
+  gvproxy-egress-policy:
+    file: patches/gvproxy-egress-policy-v2.patch
+    sha256: dd5907fb04acb41b8c7f9fe7a3f7c963be2db17de1d8cac4ad261e093079e41c
+    status: experimental
+  nerdbox-cgroup-caps:
+    file: patches/nerdbox-klorq-cgroup-caps.patch
+    sha256: efcd345c96360693cd8f347eedeb33ddcc048f5bed8e9673eebe46c83a299dc4
+    status: experimental
+images:
+  default:
+    ref: docker.io/library/alpine:3.22
+    digest: sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f

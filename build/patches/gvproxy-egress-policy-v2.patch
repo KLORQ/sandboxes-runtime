@@ -1,0 +1,1273 @@
+diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
+index 16cbad4..4a653af 100644
+--- a/cmd/gvproxy/config.go
++++ b/cmd/gvproxy/config.go
+@@ -24,31 +24,32 @@ const (
+ )
+ 
+ type GvproxyArgs struct {
+-	config             string
+-	endpoints          arrayFlags
+-	debug              bool
+-	mtu                int
+-	sshPort            int
+-	subnet             string
+-	gatewayIP          string
+-	deviceIP           string
+-	hostIP             string
+-	vpnkitSocket       string
+-	qemuSocket         string
+-	bessSocket         string
+-	stdioSocket        string
+-	vfkitSocket        string
+-	notificationSocket string
+-	forwardSocket      arrayFlags
+-	forwardDest        arrayFlags
+-	forwardUser        arrayFlags
+-	forwardIdentify    arrayFlags
+-	pidFile            string
+-	pcapFile           string
+-	logFile            string
+-	servicesEndpoint   string
+-	ec2MetadataAccess  bool
+-	apiTokenFile       string
++	config              string
++	endpoints           arrayFlags
++	debug               bool
++	mtu                 int
++	sshPort             int
++	subnet              string
++	gatewayIP           string
++	deviceIP            string
++	hostIP              string
++	vpnkitSocket        string
++	qemuSocket          string
++	bessSocket          string
++	stdioSocket         string
++	vfkitSocket         string
++	notificationSocket  string
++	forwardSocket       arrayFlags
++	forwardDest         arrayFlags
++	forwardUser         arrayFlags
++	forwardIdentify     arrayFlags
++	pidFile             string
++	pcapFile            string
++	logFile             string
++	servicesEndpoint    string
++	ec2MetadataAccess   bool
++	apiTokenFile        string
++	requireEgressPolicy bool
+ }
+ 
+ type GvproxyConfig struct {
+@@ -62,13 +63,17 @@ type GvproxyConfig struct {
+ 		Stdio  string `yaml:"stdio,omitempty"`
+ 		Vfkit  string `yaml:"vfkit,omitempty"`
+ 	} `yaml:"interfaces,omitempty"`
+-	Forwards           []GvproxyConfigForward `yaml:"forwards,omitempty"`
+-	PIDFile            string                 `yaml:"pid-file,omitempty"`
+-	LogFile            string                 `yaml:"log-file,omitempty"`
+-	Services           string                 `yaml:"services,omitempty"`
+-	Ec2MetadataAccess  bool                   `yaml:"ec2-metadata-access,omitempty"`
+-	NotificationSocket string                 `yaml:"notification,omitempty"`
+-	APITokenFile       string                 `yaml:"api-token-file,omitempty"`
++	Forwards            []GvproxyConfigForward `yaml:"forwards,omitempty"`
++	PIDFile             string                 `yaml:"pid-file,omitempty"`
++	LogFile             string                 `yaml:"log-file,omitempty"`
++	Services            string                 `yaml:"services,omitempty"`
++	Ec2MetadataAccess   bool                   `yaml:"ec2-metadata-access,omitempty"`
++	NotificationSocket  string                 `yaml:"notification,omitempty"`
++	APITokenFile        string                 `yaml:"api-token-file,omitempty"`
++	RequireEgressPolicy bool                   `yaml:"require-egress-policy,omitempty"`
++	// ConfigPath is the file used for SIGHUP policy reloads. It is not part of
++	// the serialized configuration.
++	ConfigPath string `yaml:"-"`
+ }
+ 
+ type GvproxyConfigForward struct {
+@@ -116,6 +121,24 @@ func GvproxyInit() (*GvproxyConfig, error) {
+ 	return GvproxyConfigure(&config, &args, version.String())
+ }
+ 
++// LoadEgressPolicyFromFile reads only the policy portion of a gvproxy YAML
++// configuration. It is used for SIGHUP reloads and performs no IO on success
++// other than the read itself.
++func LoadEgressPolicyFromFile(path string) (*types.EgressPolicy, error) {
++	content, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read config file: %w", err)
++	}
++	var config GvproxyConfig
++	if err := yaml.Unmarshal(content, &config); err != nil {
++		return nil, fmt.Errorf("failed to parse configuration: %w", err)
++	}
++	if err := config.Stack.EgressPolicy.Validate(); err != nil {
++		return nil, fmt.Errorf("invalid egress policy: %w", err)
++	}
++	return config.Stack.EgressPolicy, nil
++}
++
+ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*GvproxyArgs, error) {
+ 	flagSet.StringVar(&args.config, "config", "", "Use configuration file with command line override")
+ 	flagSet.Var(&args.endpoints, "listen", "control endpoint")
+@@ -142,6 +165,7 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
+ 	flagSet.BoolVar(&args.ec2MetadataAccess, "ec2-metadata-access", false, "Permits access to EC2 Metadata Service and Amazon Time Sync Service")
+ 	flagSet.StringVar(&args.notificationSocket, "notification", "", "Socket to be used to send network-ready notifications")
+ 	flagSet.StringVar(&args.apiTokenFile, "api-token-file", "", "Path to file where API token will be read from (needs 0600 permissions on macOS and Linux)")
++	flagSet.BoolVar(&args.requireEgressPolicy, "require-egress-policy", false, "Fail closed unless the configuration contains an egressPolicy")
+ 	if err := flagSet.Parse(argv); err != nil {
+ 		return nil, err
+ 	}
+@@ -313,6 +337,16 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
+ 	if args.apiTokenFile != "" {
+ 		config.APITokenFile = args.apiTokenFile
+ 	}
++	if args.requireEgressPolicy {
++		config.RequireEgressPolicy = true
++	}
++	config.ConfigPath = args.config
++	if err := config.Stack.EgressPolicy.Validate(); err != nil {
++		return config, fmt.Errorf("invalid egress policy: %w", err)
++	}
++	if config.RequireEgressPolicy && config.Stack.EgressPolicy == nil {
++		return config, errors.New("egress policy is required but not configured")
++	}
+ 
+ 	// Make sure the qemu socket provided is valid syntax
+ 	if config.Interfaces.Qemu != "" {
+diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
+index 21ab61e..cb7c7fb 100644
+--- a/cmd/gvproxy/main.go
++++ b/cmd/gvproxy/main.go
+@@ -45,8 +45,10 @@ func main() {
+ 	log.Info(GvproxyVersion())
+ 
+ 	ctx, cancel := context.WithCancel(context.Background())
+-	// Make this the last defer statement in the stack
+-	defer log.Exit(exitCode)
++	// Make this the last defer statement in the stack. The closure is required
++	// because deferred arguments are evaluated immediately; log.Exit(exitCode)
++	// would always observe the initial zero value and mask startup failures.
++	defer func() { log.Exit(exitCode) }()
+ 
+ 	// Create a PID file if requested
+ 	if config.PIDFile != "" {
+@@ -118,7 +120,7 @@ func InDebugMode() bool {
+ }
+ 
+ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+-	vn, err := virtualnetwork.New(&config.Stack)
++	vn, err := virtualnetwork.New(&config.Stack, config.RequireEgressPolicy)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -131,6 +133,34 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+ 		return err
+ 	})
+ 
++	// SIGHUP reloads only the egress policy. Invalid updates are rejected and
++	// the previous immutable snapshot remains active.
++	sighup := make(chan os.Signal, 1)
++	signal.Notify(sighup, syscall.SIGHUP)
++	g.Go(func() error {
++		for {
++			select {
++			case <-ctx.Done():
++				return nil
++			case <-sighup:
++				if config.ConfigPath == "" {
++					log.Warning("SIGHUP ignored: gvproxy was not started with -config")
++					continue
++				}
++				policy, err := LoadEgressPolicyFromFile(config.ConfigPath)
++				if err != nil {
++					log.Errorf("egress policy reload rejected: %v", err)
++					continue
++				}
++				if err := vn.UpdateEgressPolicy(policy); err != nil {
++					log.Errorf("egress policy reload rejected: %v", err)
++					continue
++				}
++				log.Infof("egress policy reloaded revision=%s", vn.EgressPolicyRevision())
++			}
++		}
++	})
++
+ 	// Configure API token from file or environment variable
+ 	apiToken, err := tokenauth.ReadToken(config.APITokenFile)
+ 	if err != nil {
+diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
+index aeeb976..eda8b38 100644
+--- a/pkg/services/dns/dns.go
++++ b/pkg/services/dns/dns.go
+@@ -28,9 +28,10 @@ type upstreamResolver interface {
+ var validDNSChars = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+ 
+ type dnsHandler struct {
+-	zones     []types.Zone
+-	zonesLock sync.RWMutex
+-	upstream  upstreamResolver
++	zones         []types.Zone
++	zonesLock     sync.RWMutex
++	upstream      upstreamResolver
++	allowUpstream bool
+ 	// nameservers are the host's upstream DNS servers ("ip:port") used to
+ 	// forward raw queries for record types that Go's net.Resolver cannot
+ 	// look up directly (SOA, PTR, AAAA, CAA, ...).
+@@ -134,6 +135,10 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+ 		if done := h.addLocalAnswers(m, q); done {
+ 			return
+ 		}
++		if !h.allowUpstream {
++			m.Rcode = dns.RcodeRefused
++			return
++		}
+ 
+ 		resolver := h.upstream
+ 		switch q.Qtype {
+@@ -309,19 +314,28 @@ type Server struct {
+ 	handler *dnsHandler
+ }
+ 
+-func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone) (*Server, error) {
++func New(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, allowUpstreamOption ...bool) (*Server, error) {
+ 	upstream := &net.Resolver{
+ 		PreferGo: false,
+ 	}
+-	return NewWithUpstreamResolver(udpConn, tcpLn, zones, upstream)
++	allowUpstream := true
++	if len(allowUpstreamOption) > 0 {
++		allowUpstream = allowUpstreamOption[0]
++	}
++	return NewWithUpstreamResolver(udpConn, tcpLn, zones, upstream, allowUpstream)
+ }
+ 
+-func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver) (*Server, error) {
++func NewWithUpstreamResolver(udpConn net.PacketConn, tcpLn net.Listener, zones []types.Zone, upstream upstreamResolver, allowUpstreamOption ...bool) (*Server, error) {
++	allowUpstream := true
++	if len(allowUpstreamOption) > 0 {
++		allowUpstream = allowUpstreamOption[0]
++	}
+ 	handler := &dnsHandler{
+-		zones:       zones,
+-		upstream:    upstream,
+-		nameservers: hostNameservers(),
+-		client:      &dns.Client{},
++		zones:         zones,
++		upstream:      upstream,
++		allowUpstream: allowUpstream,
++		nameservers:   hostNameservers(),
++		client:        &dns.Client{},
+ 	}
+ 	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}, nil
+ }
+diff --git a/pkg/services/dns/egress_policy_test.go b/pkg/services/dns/egress_policy_test.go
+new file mode 100644
+index 0000000..f720f19
+--- /dev/null
++++ b/pkg/services/dns/egress_policy_test.go
+@@ -0,0 +1,38 @@
++package dns
++
++import (
++	"net"
++	"testing"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"github.com/miekg/dns"
++)
++
++func TestEgressPolicyBlocksExternalDNSFallback(t *testing.T) {
++	h := &dnsHandler{allowUpstream: false}
++	m := new(dns.Msg)
++	m.SetQuestion("example.invalid.", dns.TypeA)
++	h.addAnswers(m)
++	if m.Rcode != dns.RcodeRefused {
++		t.Fatalf("got Rcode %d, want REFUSED", m.Rcode)
++	}
++	if len(m.Answer) != 0 {
++		t.Fatalf("got unexpected external answer: %v", m.Answer)
++	}
++}
++
++func TestEgressPolicyKeepsLocalDNSZones(t *testing.T) {
++	h := &dnsHandler{
++		allowUpstream: false,
++		zones: []types.Zone{{
++			Name:      "internal.",
++			DefaultIP: net.ParseIP("192.168.127.1"),
++		}},
++	}
++	m := new(dns.Msg)
++	m.SetQuestion("host.internal.", dns.TypeA)
++	h.addAnswers(m)
++	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 1 {
++		t.Fatalf("got rcode=%d answers=%v, want local A answer", m.Rcode, m.Answer)
++	}
++}
+diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
+index 6a1f548..3532b55 100644
+--- a/pkg/services/forwarder/tcp.go
++++ b/pkg/services/forwarder/tcp.go
+@@ -7,6 +7,7 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
+ 	"github.com/inetaf/tcpproxy"
+ 	log "github.com/sirupsen/logrus"
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+@@ -23,7 +24,7 @@ const (
+ 	defaultTCPConnectTimeout = 30 * time.Second
+ )
+ 
+-func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, maxInFlight int, connectTimeout time.Duration) *tcp.Forwarder {
++func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, maxInFlight int, connectTimeout time.Duration, policy *types.EgressPolicyHolder) *tcp.Forwarder {
+ 	if maxInFlight <= 0 {
+ 		maxInFlight = defaultTCPMaxInFlight
+ 	}
+@@ -43,12 +44,26 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
+ 		}
+ 		natLock.Unlock()
++		if !policy.Allows("tcp", localAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied tcp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
++			r.Complete(true)
++			return
++		}
+ 		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
+ 		if err != nil {
+ 			log.Tracef("net.DialTimeout() = %v", err)
+ 			r.Complete(true)
+ 			return
+ 		}
++		flowID := policy.Track("tcp", localAddress.String(), r.ID().LocalPort, outbound)
++		if flowID == 0 && policy.Enabled() {
++			_ = outbound.Close()
++			r.Complete(true)
++			return
++		}
++		if flowID != 0 {
++			defer policy.Untrack(flowID)
++		}
+ 
+ 		var wq waiter.Queue
+ 		ep, tcpErr := r.CreateEndpoint(&wq)
+diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
+index 1269449..eb985d5 100644
+--- a/pkg/services/forwarder/udp.go
++++ b/pkg/services/forwarder/udp.go
+@@ -5,6 +5,7 @@ import (
+ 	"strconv"
+ 	"sync"
+ 
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
+ 	log "github.com/sirupsen/logrus"
+ 	"gvisor.dev/gvisor/pkg/tcpip"
+ 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+@@ -14,7 +15,7 @@ import (
+ 	"gvisor.dev/gvisor/pkg/waiter"
+ )
+ 
+-func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *udp.Forwarder {
++func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, policy *types.EgressPolicyHolder) *udp.Forwarder {
+ 	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
+ 		localAddress := r.ID().LocalAddress
+ 
+@@ -27,6 +28,10 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
+ 		}
+ 		natLock.Unlock()
++		if !policy.Allows("udp", localAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied udp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
++			return true
++		}
+ 
+ 		var wq waiter.Queue
+ 		ep, tcpErr := r.CreateEndpoint(&wq)
+@@ -43,7 +48,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 		p, _ := NewUDPProxy(&autoStoppingListener{underlying: gonet.NewUDPConn(&wq, ep)}, func(_ net.Addr) (net.Conn, error) {
+ 			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
+ 		})
++		flowID := policy.Track("udp", localAddress.String(), r.ID().LocalPort, p)
++		if flowID == 0 && policy.Enabled() {
++			_ = p.Close()
++			return true
++		}
+ 		go func() {
++			if flowID != 0 {
++				defer policy.Untrack(flowID)
++			}
+ 			p.Run()
+ 
+ 			// note that at this point packets that are sent to the current forwarder session
+diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
+index 613b32a..37964e2 100644
+--- a/pkg/types/configuration.go
++++ b/pkg/types/configuration.go
+@@ -34,6 +34,11 @@ type Configuration struct {
+ 	// Built-in DNS records that will be served by the DNS server embedded in the gateway
+ 	DNS []Zone `yaml:"dns,omitempty"`
+ 
++	// DNSUpstream is an optional host:port resolver used instead of the system
++	// resolver. It is intended for a controlled policy fixture; when set, it is
++	// the only upstream the gateway is allowed to query.
++	DNSUpstream string `yaml:"dnsUpstream,omitempty"`
++
+ 	// List of search domains that will be added in all DHCP replies
+ 	DNSSearchDomains []string `yaml:"dnsSearchDomains,omitempty"`
+ 
+@@ -65,6 +70,10 @@ type Configuration struct {
+ 
+ 	// Timeout in seconds for outbound TCP connection attempts (default: 30)
+ 	TCPConnectTimeout int `yaml:"tcpConnectTimeout,omitempty"`
++
++	// Optional host-enforced layer 3/4 allowlist for sandbox egress.
++	// When present, unmatched TCP and UDP flows are denied.
++	EgressPolicy *EgressPolicy `yaml:"egressPolicy,omitempty"`
+ }
+ 
+ type Protocol string
+diff --git a/pkg/types/egress_policy.go b/pkg/types/egress_policy.go
+new file mode 100644
+index 0000000..ba3415b
+--- /dev/null
++++ b/pkg/types/egress_policy.go
+@@ -0,0 +1,432 @@
++package types
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net"
++	"os"
++	"strings"
++	"sync"
++	"time"
++)
++
++// EgressRule matches one transport, destination CIDR, and optional destination
++// port. Protocol must be explicitly "tcp" or "udp". An empty CIDR is only
++// accepted when the policy sets allowAny: true, so a missing field cannot
++// silently turn a rule into an allow-all rule. Port 0 means any port.
++type EgressRule struct {
++	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
++	CIDR     string `yaml:"cidr,omitempty" json:"cidr,omitempty"`
++	Port     uint16 `yaml:"port,omitempty" json:"port,omitempty"`
++}
++
++// EgressPolicy is a host-enforced default-deny policy. Allow rules are
++// evaluated after deny rules. Revision is copied into every decision record;
++// it is intentionally a string so callers can use an opaque generation token.
++type EgressPolicy struct {
++	Revision  string       `yaml:"revision,omitempty" json:"revision,omitempty"`
++	SandboxID string       `yaml:"sandboxID,omitempty" json:"sandboxID,omitempty"`
++	AllowAny  bool         `yaml:"allowAny,omitempty" json:"allowAny,omitempty"`
++	Allow     []EgressRule `yaml:"allow,omitempty" json:"allow,omitempty"`
++	Deny      []EgressRule `yaml:"deny,omitempty" json:"deny,omitempty"`
++	// AuditLog is the path of an append-only JSONL decision log. An empty path
++	// disables the file log, but decisions are still enforced.
++	AuditLog string `yaml:"auditLog,omitempty" json:"auditLog,omitempty"`
++}
++
++// EgressDecision is one policy outcome. It intentionally contains no headers,
++// payloads, credentials, or hostnames that were not already in the policy.
++type EgressDecision struct {
++	Time        string `json:"time"`
++	SandboxID   string `json:"sandboxId,omitempty"`
++	Revision    string `json:"revision"`
++	Protocol    string `json:"protocol"`
++	Destination string `json:"destination"`
++	Port        uint16 `json:"port"`
++	Action      string `json:"action"`
++	Rule        string `json:"rule"`
++}
++
++type compiledEgressRule struct {
++	protocol string
++	network  *net.IPNet
++	port     uint16
++	source   string
++}
++
++func (r compiledEgressRule) matches(protocol string, ip net.IP, port uint16) bool {
++	if r.protocol != protocol {
++		return false
++	}
++	if r.port != 0 && r.port != port {
++		return false
++	}
++	if r.network == nil {
++		return true
++	}
++	return r.network.Contains(ip)
++}
++
++type egressSnapshot struct {
++	revision  string
++	sandboxID string
++	allow     []compiledEgressRule
++	deny      []compiledEgressRule
++}
++
++func (s *egressSnapshot) decide(protocol, address string, port uint16) (bool, string) {
++	ip := net.ParseIP(address)
++	if ip == nil {
++		return false, "invalid-destination"
++	}
++	if v4 := ip.To4(); v4 != nil {
++		ip = v4
++	}
++	for _, rule := range s.deny {
++		if rule.matches(protocol, ip, port) {
++			return false, "deny:" + rule.source
++		}
++	}
++	for _, rule := range s.allow {
++		if rule.matches(protocol, ip, port) {
++			return true, "allow:" + rule.source
++		}
++	}
++	return false, "default-deny"
++}
++
++func compileEgressRules(direction string, rules []EgressRule, allowAny bool) ([]compiledEgressRule, error) {
++	compiled := make([]compiledEgressRule, 0, len(rules))
++	for i, rule := range rules {
++		protocol := strings.ToLower(strings.TrimSpace(rule.Protocol))
++		if protocol != "tcp" && protocol != "udp" {
++			return nil, fmt.Errorf("%s rule %d: protocol must be tcp or udp, got %q", direction, i, rule.Protocol)
++		}
++		var network *net.IPNet
++		if rule.CIDR == "" {
++			if !allowAny || direction == "deny" {
++				return nil, fmt.Errorf("%s rule %d: empty cidr is not allowed (set allowAny: true for an allow-all rule)", direction, i)
++			}
++		} else {
++			_, parsed, err := net.ParseCIDR(strings.TrimSpace(rule.CIDR))
++			if err != nil {
++				return nil, fmt.Errorf("%s rule %d: invalid cidr %q: %w", direction, i, rule.CIDR, err)
++			}
++			network = parsed
++		}
++		source := fmt.Sprintf("%s %s port=%d", protocol, rule.CIDR, rule.Port)
++		if rule.CIDR == "" {
++			source = fmt.Sprintf("%s any port=%d", protocol, rule.Port)
++		}
++		compiled = append(compiled, compiledEgressRule{
++			protocol: protocol,
++			network:  network,
++			port:     rule.Port,
++			source:   source,
++		})
++	}
++	return compiled, nil
++}
++
++func compileEgressPolicy(policy *EgressPolicy) (*egressSnapshot, error) {
++	allow, err := compileEgressRules("allow", policy.Allow, policy.AllowAny)
++	if err != nil {
++		return nil, err
++	}
++	deny, err := compileEgressRules("deny", policy.Deny, false)
++	if err != nil {
++		return nil, err
++	}
++	revision := policy.Revision
++	if revision == "" {
++		revision = "0"
++	}
++	return &egressSnapshot{
++		revision:  revision,
++		sandboxID: policy.SandboxID,
++		allow:     allow,
++		deny:      deny,
++	}, nil
++}
++
++// Validate checks the policy before any network service starts.
++func (p *EgressPolicy) Validate() error {
++	if p == nil {
++		return nil
++	}
++	_, err := compileEgressPolicy(p)
++	return err
++}
++
++type egressAudit struct {
++	mu   sync.Mutex
++	file *os.File
++}
++
++func openEgressAudit(path string) (*egressAudit, error) {
++	if path == "" {
++		return nil, nil
++	}
++	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
++	if err != nil {
++		return nil, fmt.Errorf("cannot open egress audit log %q: %w", path, err)
++	}
++	return &egressAudit{file: file}, nil
++}
++
++func (a *egressAudit) record(decision EgressDecision) error {
++	if a == nil {
++		return nil
++	}
++	decision.Time = time.Now().UTC().Format(time.RFC3339Nano)
++	line, err := json.Marshal(decision)
++	if err != nil {
++		return err
++	}
++	line = append(line, '\n')
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	if _, err := a.file.Write(line); err != nil {
++		return err
++	}
++	return a.file.Sync()
++}
++
++func (a *egressAudit) close() error {
++	if a == nil {
++		return nil
++	}
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	return a.file.Close()
++}
++
++// EgressPolicyHolder provides atomic replacement of the active policy. A nil
++// holder, or a holder with no policy, preserves the upstream permissive
++// behavior only when the holder was created without required=true.
++type trackedEgressFlow struct {
++	protocol string
++	address  string
++	port     uint16
++	closer   io.Closer
++}
++
++type EgressPolicyHolder struct {
++	mu         sync.RWMutex
++	snapshot   *egressSnapshot
++	audit      *egressAudit
++	required   bool
++	flows      map[uint64]trackedEgressFlow
++	nextFlowID uint64
++}
++
++func NewEgressPolicyHolder(policy *EgressPolicy, required bool) (*EgressPolicyHolder, error) {
++	holder := &EgressPolicyHolder{required: required, flows: make(map[uint64]trackedEgressFlow)}
++	if policy == nil {
++		if required {
++			return nil, fmt.Errorf("egress policy is required but not configured")
++		}
++		return holder, nil
++	}
++	snapshot, err := compileEgressPolicy(policy)
++	if err != nil {
++		return nil, err
++	}
++	audit, err := openEgressAudit(policy.AuditLog)
++	if err != nil {
++		return nil, err
++	}
++	holder.snapshot = snapshot
++	holder.audit = audit
++	return holder, nil
++}
++
++// Enabled reports whether a policy is currently active.
++func (h *EgressPolicyHolder) Enabled() bool {
++	if h == nil {
++		return false
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	return h.snapshot != nil
++}
++
++// Revision returns the active revision, or "" when no policy is active.
++func (h *EgressPolicyHolder) Revision() string {
++	if h == nil {
++		return ""
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	if h.snapshot == nil {
++		return ""
++	}
++	return h.snapshot.revision
++}
++
++// Update compiles a new policy and swaps it atomically. It never mutates the
++// active snapshot. The audit sink is fixed for the lifetime of the holder; a
++// changed auditLog path is rejected instead of silently redirecting records.
++func (h *EgressPolicyHolder) Update(policy *EgressPolicy) error {
++	if h == nil {
++		if policy == nil {
++			return nil
++		}
++		return fmt.Errorf("cannot update a nil egress policy holder")
++	}
++	if policy == nil {
++		if h.required {
++			return fmt.Errorf("egress policy is required; refusing to remove it")
++		}
++		h.mu.Lock()
++		h.snapshot = nil
++		h.mu.Unlock()
++		return nil
++	}
++	if h.audit != nil && policy.AuditLog == "" {
++		return fmt.Errorf("cannot disable the active egress audit log")
++	}
++	if h.audit == nil && policy.AuditLog != "" {
++		return fmt.Errorf("cannot add an audit log after startup; restart required")
++	}
++	snapshot, err := compileEgressPolicy(policy)
++	if err != nil {
++		return err
++	}
++	type revocation struct {
++		decision EgressDecision
++		closer   io.Closer
++	}
++	var revocations []revocation
++	h.mu.Lock()
++	h.snapshot = snapshot
++	for id, flow := range h.flows {
++		allowed, rule := snapshot.decide(flow.protocol, flow.address, flow.port)
++		if allowed {
++			continue
++		}
++		delete(h.flows, id)
++		revocations = append(revocations, revocation{
++			decision: EgressDecision{
++				SandboxID:   snapshot.sandboxID,
++				Revision:    snapshot.revision,
++				Protocol:    flow.protocol,
++				Destination: flow.address,
++				Port:        flow.port,
++				Action:      "deny",
++				Rule:        "revoke:" + rule,
++			},
++			closer: flow.closer,
++		})
++	}
++	audit := h.audit
++	h.mu.Unlock()
++	for _, revocation := range revocations {
++		if audit != nil {
++			_ = audit.record(revocation.decision)
++		}
++		_ = revocation.closer.Close()
++	}
++	return nil
++}
++
++// Track registers an established flow so a later policy revision can close it.
++// The caller already evaluated Allows for the initial dial; Track only audits
++// a denial that happened in the race between that check and registration.
++// A nil policy or a nil closer returns 0 without tracking.
++func (h *EgressPolicyHolder) Track(protocol, address string, port uint16, closer io.Closer) uint64 {
++	if h == nil || closer == nil {
++		return 0
++	}
++	h.mu.Lock()
++	snapshot := h.snapshot
++	if snapshot == nil {
++		h.mu.Unlock()
++		return 0
++	}
++	allowed, rule := snapshot.decide(protocol, address, port)
++	if !allowed {
++		audit := h.audit
++		h.mu.Unlock()
++		if audit != nil {
++			_ = audit.record(EgressDecision{
++				SandboxID:   snapshot.sandboxID,
++				Revision:    snapshot.revision,
++				Protocol:    protocol,
++				Destination: address,
++				Port:        port,
++				Action:      "deny",
++				Rule:        rule,
++			})
++		}
++		return 0
++	}
++	h.nextFlowID++
++	id := h.nextFlowID
++	h.flows[id] = trackedEgressFlow{protocol: protocol, address: address, port: port, closer: closer}
++	h.mu.Unlock()
++	return id
++}
++
++// Untrack removes a flow that ended normally. It is safe to call after Close
++// or after a policy revocation already removed the flow.
++func (h *EgressPolicyHolder) Untrack(id uint64) {
++	if h == nil || id == 0 {
++		return
++	}
++	h.mu.Lock()
++	delete(h.flows, id)
++	h.mu.Unlock()
++}
++
++// Allows evaluates a flow and writes one audit record when an audit sink is
++// configured. A nil holder allows the flow for upstream compatibility.
++func (h *EgressPolicyHolder) Allows(protocol, address string, port uint16) bool {
++	if h == nil {
++		return true
++	}
++	h.mu.RLock()
++	snapshot := h.snapshot
++	audit := h.audit
++	h.mu.RUnlock()
++	if snapshot == nil {
++		return true
++	}
++	allowed, rule := snapshot.decide(protocol, address, port)
++	action := "deny"
++	if allowed {
++		action = "allow"
++	}
++	if audit != nil {
++		// Audit failure must not change the enforcement decision; the
++		// caller-facing decision is already computed and fail-closed.
++		_ = audit.record(EgressDecision{
++			SandboxID:   snapshot.sandboxID,
++			Revision:    snapshot.revision,
++			Protocol:    protocol,
++			Destination: address,
++			Port:        port,
++			Action:      action,
++			Rule:        rule,
++		})
++	}
++	return allowed
++}
++
++func (h *EgressPolicyHolder) Close() error {
++	if h == nil {
++		return nil
++	}
++	h.mu.Lock()
++	audit := h.audit
++	flows := h.flows
++	h.flows = make(map[uint64]trackedEgressFlow)
++	h.audit = nil
++	h.snapshot = nil
++	h.mu.Unlock()
++	for _, flow := range flows {
++		_ = flow.closer.Close()
++	}
++	return audit.close()
++}
+diff --git a/pkg/types/egress_policy_test.go b/pkg/types/egress_policy_test.go
+new file mode 100644
+index 0000000..41bea30
+--- /dev/null
++++ b/pkg/types/egress_policy_test.go
+@@ -0,0 +1,259 @@
++package types
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func TestEgressPolicyAllowlist(t *testing.T) {
++	policy := &EgressPolicy{Revision: "r1", Allow: []EgressRule{{
++		Protocol: "tcp",
++		CIDR:     "127.0.0.1/32",
++		Port:     39489,
++	}}}
++	holder, err := NewEgressPolicyHolder(policy, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	tests := []struct {
++		name     string
++		protocol string
++		address  string
++		port     uint16
++		want     bool
++	}{
++		{"exact tuple allowed", "tcp", "127.0.0.1", 39489, true},
++		{"wrong port denied", "tcp", "127.0.0.1", 39490, false},
++		{"wrong protocol denied", "udp", "127.0.0.1", 39489, false},
++		{"wrong address denied", "tcp", "192.0.2.10", 39489, false},
++		{"invalid address denied", "tcp", "not-an-ip", 39489, false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := holder.Allows(tt.protocol, tt.address, tt.port); got != tt.want {
++				t.Fatalf("Allows(%q, %q, %d) = %v, want %v", tt.protocol, tt.address, tt.port, got, tt.want)
++			}
++		})
++	}
++}
++
++func TestNilEgressPolicyRetainsLegacyForwarding(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(nil, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	if holder.Enabled() {
++		t.Fatal("nil policy must not be enabled")
++	}
++	if !holder.Allows("tcp", "203.0.113.1", 443) {
++		t.Fatal("nil policy must preserve upstream default forwarding")
++	}
++}
++
++func TestRequiredEgressPolicyFailsClosed(t *testing.T) {
++	if _, err := NewEgressPolicyHolder(nil, true); err == nil {
++		t.Fatal("required policy with nil configuration must fail")
++	}
++}
++
++func TestEmptyEgressPolicyDeniesByDefault(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{Revision: "empty"}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	if holder.Allows("tcp", "127.0.0.1", 443) || holder.Allows("udp", "127.0.0.1", 53) {
++		t.Fatal("a present policy with no allow rules must deny by default")
++	}
++}
++
++func TestInvalidCIDRDoesNotAllow(t *testing.T) {
++	policy := &EgressPolicy{Allow: []EgressRule{{Protocol: "tcp", CIDR: "invalid", Port: 443}}}
++	if err := policy.Validate(); err == nil {
++		t.Fatal("invalid CIDR must be rejected at validation time")
++	}
++}
++
++func TestEmptyProtocolIsRejected(t *testing.T) {
++	policy := &EgressPolicy{Allow: []EgressRule{{CIDR: "127.0.0.1/32", Port: 443}}}
++	if err := policy.Validate(); err == nil {
++		t.Fatal("empty protocol must not be an implicit wildcard")
++	}
++}
++
++func TestEmptyCIDRNeedsExplicitAllowAny(t *testing.T) {
++	policy := &EgressPolicy{Allow: []EgressRule{{Protocol: "tcp", Port: 443}}}
++	if err := policy.Validate(); err == nil {
++		t.Fatal("empty CIDR without allowAny must be rejected")
++	}
++	policy.AllowAny = true
++	if err := policy.Validate(); err != nil {
++		t.Fatalf("empty CIDR with allowAny should be accepted: %v", err)
++	}
++	holder, err := NewEgressPolicyHolder(policy, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	if !holder.Allows("tcp", "203.0.113.1", 443) {
++		t.Fatal("explicit allowAny rule should allow any address on its port")
++	}
++	if holder.Allows("tcp", "203.0.113.1", 444) {
++		t.Fatal("explicit allowAny rule must still honor the port")
++	}
++}
++
++func TestDenyTakesPrecedence(t *testing.T) {
++	policy := &EgressPolicy{
++		Revision: "r2",
++		Allow:    []EgressRule{{Protocol: "tcp", CIDR: "10.0.0.0/8"}},
++		Deny:     []EgressRule{{Protocol: "tcp", CIDR: "10.1.0.0/16"}},
++	}
++	holder, err := NewEgressPolicyHolder(policy, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	if !holder.Allows("tcp", "10.2.0.1", 443) {
++		t.Fatal("allowed CIDR should be allowed")
++	}
++	if holder.Allows("tcp", "10.1.2.3", 443) {
++		t.Fatal("deny must take precedence over allow")
++	}
++}
++
++func TestAuditRecordContainsRevisionAndRule(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "egress.jsonl")
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision:  "r3",
++		SandboxID: "sbx-test",
++		AuditLog:  path,
++		Allow:     []EgressRule{{Protocol: "tcp", CIDR: "127.0.0.1/32", Port: 39489}},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !holder.Allows("tcp", "127.0.0.1", 39489) {
++		t.Fatal("expected allow")
++	}
++	if holder.Allows("tcp", "127.0.0.1", 39490) {
++		t.Fatal("expected deny")
++	}
++	if err := holder.Close(); err != nil {
++		t.Fatal(err)
++	}
++	content, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(content) == 0 {
++		t.Fatal("audit log is empty")
++	}
++	for _, want := range []string{`"revision":"r3"`, `"sandboxId":"sbx-test"`, `"action":"allow"`, `"action":"deny"`, `"rule":"default-deny"`} {
++		if !strings.Contains(string(content), want) {
++			t.Fatalf("audit log does not contain %s: %s", want, content)
++		}
++	}
++}
++
++type fakeCloser struct {
++	closed bool
++}
++
++func (f *fakeCloser) Close() error {
++	f.closed = true
++	return nil
++}
++
++func TestTrackedFlowIsClosedOnRevocation(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "egress.jsonl")
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision: "r1",
++		AuditLog: path,
++		Allow:    []EgressRule{{Protocol: "tcp", CIDR: "127.0.0.1/32", Port: 39489}},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	flow := &fakeCloser{}
++	id := holder.Track("tcp", "127.0.0.1", 39489, flow)
++	if id == 0 {
++		t.Fatal("allowed flow was not tracked")
++	}
++	if err := holder.Update(&EgressPolicy{
++		Revision: "r2",
++		AuditLog: path,
++		Deny:     []EgressRule{{Protocol: "tcp", CIDR: "127.0.0.1/32", Port: 39489}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if !flow.closed {
++		t.Fatal("established flow was not closed after revocation")
++	}
++	holder.Untrack(id)
++	content, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(content), `"rule":"revoke:deny:tcp 127.0.0.1/32 port=39489"`) {
++		t.Fatalf("audit does not contain revocation record: %s", content)
++	}
++}
++
++func TestTrackDeniedFlowReturnsZero(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision: "r1",
++		Allow:    []EgressRule{{Protocol: "tcp", CIDR: "127.0.0.1/32", Port: 39489}},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	flow := &fakeCloser{}
++	if id := holder.Track("tcp", "127.0.0.1", 39490, flow); id != 0 {
++		t.Fatal("denied flow must not be tracked")
++	}
++	if flow.closed {
++		t.Fatal("Track must not close a flow it never owned")
++	}
++}
++
++func TestPolicyUpdateSwapsRevision(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "egress.jsonl")
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision: "r1",
++		AuditLog: path,
++		Allow:    []EgressRule{{Protocol: "tcp", CIDR: "127.0.0.1/32", Port: 39489}},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	if !holder.Allows("tcp", "127.0.0.1", 39489) {
++		t.Fatal("initial policy should allow port 39489")
++	}
++	if err := holder.Update(&EgressPolicy{
++		Revision: "r2",
++		AuditLog: path,
++		Allow:    []EgressRule{{Protocol: "tcp", CIDR: "127.0.0.1/32", Port: 39490}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if holder.Revision() != "r2" {
++		t.Fatalf("revision = %q, want r2", holder.Revision())
++	}
++	if holder.Allows("tcp", "127.0.0.1", 39489) {
++		t.Fatal("old rule must not survive update")
++	}
++	if !holder.Allows("tcp", "127.0.0.1", 39490) {
++		t.Fatal("new rule should allow port 39490")
++	}
++	if err := holder.Update(nil); err == nil {
++		t.Fatal("required holder must refuse removal")
++	}
++}
+diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
+index 3ed9a99..f9ca825 100644
+--- a/pkg/virtualnetwork/services.go
++++ b/pkg/virtualnetwork/services.go
+@@ -1,6 +1,7 @@
+ package virtualnetwork
+ 
+ import (
++	"context"
+ 	"net"
+ 	"net/http"
+ 	"sync"
+@@ -21,19 +22,21 @@ import (
+ 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+ )
+ 
+-func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, portsForwarder *forwarder.PortsForwarder) (http.Handler, error) {
++func addServices(configuration *types.Configuration, s *stack.Stack, ipPool *tap.IPPool, portsForwarder *forwarder.PortsForwarder, egressPolicy *types.EgressPolicyHolder) (http.Handler, error) {
+ 	var natLock sync.Mutex
+ 	translation := parseNATTable(configuration)
+ 
+ 	tcpForwarder := forwarder.TCP(s, translation, &natLock, configuration.Ec2MetadataAccess,
+-		configuration.TCPMaxInFlight, time.Duration(configuration.TCPConnectTimeout)*time.Second)
++		configuration.TCPMaxInFlight, time.Duration(configuration.TCPConnectTimeout)*time.Second, egressPolicy)
+ 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpForwarder.HandlePacket)
+-	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess)
++	udpForwarder := forwarder.UDP(s, translation, &natLock, configuration.Ec2MetadataAccess, egressPolicy)
+ 	s.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
+-	icmpForwarder := forwarder.ICMP(s, translation, &natLock)
+-	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
++	if !egressPolicy.Enabled() {
++		icmpForwarder := forwarder.ICMP(s, translation, &natLock)
++		s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
++	}
+ 
+-	dnsMux, err := dnsServer(configuration, s)
++	dnsMux, err := dnsServer(configuration, s, !egressPolicy.Enabled())
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -58,7 +61,7 @@ func parseNATTable(configuration *types.Configuration) map[tcpip.Address]tcpip.A
+ 	return translation
+ }
+ 
+-func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler, error) {
++func dnsServer(configuration *types.Configuration, s *stack.Stack, allowUpstream bool) (http.Handler, error) {
+ 	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{
+ 		NIC:  1,
+ 		Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()),
+@@ -77,7 +80,18 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
+ 		return nil, err
+ 	}
+ 
+-	server, err := dns.New(udpConn, tcpLn, configuration.DNS)
++	var server *dns.Server
++	if configuration.DNSUpstream != "" {
++		resolver := &net.Resolver{
++			PreferGo: true,
++			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
++				return (&net.Dialer{}).DialContext(ctx, "udp", configuration.DNSUpstream)
++			},
++		}
++		server, err = dns.NewWithUpstreamResolver(udpConn, tcpLn, configuration.DNS, resolver, true)
++	} else {
++		server, err = dns.New(udpConn, tcpLn, configuration.DNS, allowUpstream)
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/pkg/virtualnetwork/virtualnetwork.go b/pkg/virtualnetwork/virtualnetwork.go
+index b2b4461..5f4ac70 100644
+--- a/pkg/virtualnetwork/virtualnetwork.go
++++ b/pkg/virtualnetwork/virtualnetwork.go
+@@ -30,6 +30,7 @@ type VirtualNetwork struct {
+ 	servicesMux    http.Handler
+ 	ipPool         *tap.IPPool
+ 	portsForwarder *forwarder.PortsForwarder
++	egressPolicy   *types.EgressPolicyHolder
+ 	apiToken       string // Bearer token for API authentication
+ }
+ 
+@@ -41,9 +42,18 @@ func (n *VirtualNetwork) SetAPIToken(token string) {
+ 	n.apiToken = token
+ }
+ 
+-func New(configuration *types.Configuration) (*VirtualNetwork, error) {
++func New(configuration *types.Configuration, requireEgressPolicy ...bool) (*VirtualNetwork, error) {
+ 	var endpoint stack.LinkEndpoint
+ 
++	required := false
++	if len(requireEgressPolicy) > 0 {
++		required = requireEgressPolicy[0]
++	}
++	egressPolicy, err := types.NewEgressPolicyHolder(configuration.EgressPolicy, required)
++	if err != nil {
++		return nil, fmt.Errorf("invalid egress policy: %w", err)
++	}
++
+ 	ipPool, err := tap.NewIPPool(configuration.Subnet)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cannot parse subnet CIDR: %w", err)
+@@ -91,7 +101,7 @@ func New(configuration *types.Configuration) (*VirtualNetwork, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cannot create ports forwarder: %w", err)
+ 	}
+-	mux, err := addServices(configuration, stack, ipPool, portsForwarder)
++	mux, err := addServices(configuration, stack, ipPool, portsForwarder, egressPolicy)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("cannot add network services: %w", err)
+ 	}
+@@ -103,11 +113,28 @@ func New(configuration *types.Configuration) (*VirtualNetwork, error) {
+ 		servicesMux:    mux,
+ 		ipPool:         ipPool,
+ 		portsForwarder: portsForwarder,
++		egressPolicy:   egressPolicy,
+ 	}, nil
+ }
+ 
+ func (n *VirtualNetwork) Close() error {
+-	return n.portsForwarder.Close()
++	err := n.portsForwarder.Close()
++	if policyErr := n.egressPolicy.Close(); err == nil {
++		err = policyErr
++	}
++	return err
++}
++
++// UpdateEgressPolicy atomically replaces the active policy for new flows.
++// Established flows are not terminated by this prototype; the caller must
++// document that revocation applies to new connections only.
++func (n *VirtualNetwork) UpdateEgressPolicy(policy *types.EgressPolicy) error {
++	return n.egressPolicy.Update(policy)
++}
++
++// EgressPolicyRevision returns the active policy revision.
++func (n *VirtualNetwork) EgressPolicyRevision() string {
++	return n.egressPolicy.Revision()
+ }
+ 
+ func (n *VirtualNetwork) BytesSent() uint64 {

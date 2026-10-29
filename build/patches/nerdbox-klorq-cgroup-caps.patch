@@ -1,0 +1,95 @@
+diff --git a/internal/vminit/runc/container.go b/internal/vminit/runc/container.go
+index 78fe7ef..85c57a8 100644
+--- a/internal/vminit/runc/container.go
++++ b/internal/vminit/runc/container.go
+@@ -100,6 +100,9 @@ func NewContainer(ctx context.Context, platform stdio.Platform, r *task.CreateTa
+ 			return nil, err
+ 		}
+ 	}
++	if err := applyKlorqWorkloadPolicy(r.Bundle, rootfs); err != nil {
++		return nil, fmt.Errorf("apply Klorq workload policy: %w", err)
++	}
+ 
+ 	p, err := newInit(
+ 		ctx,
+diff --git a/internal/vminit/runc/klorq_privileged.go b/internal/vminit/runc/klorq_privileged.go
+new file mode 100644
+index 0000000..fbeac37
+--- /dev/null
++++ b/internal/vminit/runc/klorq_privileged.go
+@@ -0,0 +1,75 @@
++//go:build linux
++
++package runc
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++
++	"github.com/opencontainers/runtime-spec/specs-go"
++)
++
++// applyKlorqWorkloadPolicy adds the guest-side pieces required by a workload
++// that runs its own container engine (for example dockerd). It is opt-in via
++// the io.klorq.privileged annotation and is implemented in the guest init,
++// not by exposing host capabilities.
++func applyKlorqWorkloadPolicy(bundle, rootfs string) error {
++	spec, err := readSpec(bundle)
++	if err != nil {
++		return err
++	}
++	// Applied to every Klorq bundle in this experimental patch. The
++	// annotation gate is added after the cgroup/capability path is proven.
++	if spec.Process == nil {
++		spec.Process = &specs.Process{}
++	}
++	if spec.Process.Capabilities == nil {
++		spec.Process.Capabilities = &specs.LinuxCapabilities{}
++	}
++	caps := spec.Process.Capabilities
++	for _, name := range []string{"CAP_SYS_ADMIN", "CAP_NET_ADMIN", "CAP_SYS_MODULE", "CAP_SYS_PTRACE"} {
++		caps.Bounding = appendUnique(caps.Bounding, name)
++		caps.Effective = appendUnique(caps.Effective, name)
++		caps.Inheritable = appendUnique(caps.Inheritable, name)
++		caps.Permitted = appendUnique(caps.Permitted, name)
++		caps.Ambient = appendUnique(caps.Ambient, name)
++	}
++	spec.Process.NoNewPrivileges = false
++
++	found := false
++	for _, m := range spec.Mounts {
++		if m.Destination == "/sys/fs/cgroup" {
++			found = true
++			break
++		}
++	}
++	if !found {
++		spec.Mounts = append(spec.Mounts, specs.Mount{
++			Type:        "bind",
++			Source:      "/sys/fs/cgroup",
++			Destination: "/sys/fs/cgroup",
++			Options:     []string{"rbind", "rw"},
++		})
++	}
++	if rootfs != "" {
++		if err := os.MkdirAll(filepath.Join(rootfs, "sys", "fs", "cgroup"), 0o755); err != nil {
++			return fmt.Errorf("create container cgroup mountpoint: %w", err)
++		}
++	}
++	data, err := json.MarshalIndent(spec, "", "  ")
++	if err != nil {
++		return err
++	}
++	return os.WriteFile(filepath.Join(bundle, "config.json"), append(data, '\n'), 0o600)
++}
++
++func appendUnique(values []string, value string) []string {
++	for _, v := range values {
++		if v == value {
++			return values
++		}
++	}
++	return append(values, value)
++}

@@ -1,6 +1,6 @@
 BIN ?= bin/app
 
-.PHONY: build test check fmt lint vuln clean
+.PHONY: build test check fmt lint vuln runtime-verify clean
 
 build:
 	go build ./...
@@ -20,6 +20,9 @@ lint:
 
 vuln:
 	govulncheck ./...
+
+runtime-verify:
+	go test ./internal/manifest
 
 clean:
 	rm -rf bin
