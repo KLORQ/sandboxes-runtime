@@ -60,12 +60,26 @@ func (m Manifest) Verify(root string) error {
 	if m.Version != 1 {
 		return fmt.Errorf("unsupported manifest version %d", m.Version)
 	}
+	if err := m.verifyComponents(); err != nil {
+		return err
+	}
+	if err := m.verifyPatches(root); err != nil {
+		return err
+	}
+	return m.verifyImages()
+}
+
+func (m Manifest) verifyComponents() error {
 	for _, name := range []string{"containerd", "nerdbox", "libkrun", "gvisor-tap-vsock"} {
 		c, ok := m.Components[name]
 		if !ok || c.Source == "" || (c.Version == "" && c.Commit == "") {
 			return fmt.Errorf("component %s is not pinned", name)
 		}
 	}
+	return nil
+}
+
+func (m Manifest) verifyPatches(root string) error {
 	names := make([]string, 0, len(m.Patches))
 	for name := range m.Patches {
 		names = append(names, name)
@@ -85,6 +99,10 @@ func (m Manifest) Verify(root string) error {
 			return fmt.Errorf("patch %s digest mismatch: got %s", name, got)
 		}
 	}
+	return nil
+}
+
+func (m Manifest) verifyImages() error {
 	for name, image := range m.Images {
 		if image.Ref == "" || !strings.HasPrefix(image.Digest, "sha256:") {
 			return fmt.Errorf("image %s is not pinned by digest", name)
