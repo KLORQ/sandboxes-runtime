@@ -31,6 +31,21 @@ type Handle struct {
 	FIFODir string
 }
 
+// NetworkAttachment is the host network data required by the runtime.
+type NetworkAttachment struct {
+	SocketPath  string
+	MAC         string
+	DeviceIP    string
+	GatewayIP   string
+	Annotations []string
+}
+
+// Network starts and stops the host-side gateway for a sandbox.
+type Network interface {
+	Start(ctx context.Context, sandbox string) (NetworkAttachment, error)
+	Stop(ctx context.Context, sandbox string) error
+}
+
 // Backend is implemented by the containerd/nerdbox adapter.
 type Backend interface {
 	Capabilities(ctx context.Context) (Capabilities, error)
