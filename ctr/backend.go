@@ -71,6 +71,11 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 	return runtime.Handle{ID: id, FIFODir: fifoDir}, nil
 }
 
+// Handle returns the runtime handle for a sandbox name.
+func (b *Backend) Handle(name string) runtime.Handle {
+	return runtime.Handle{ID: ContainerID(name), FIFODir: b.fifoDir}
+}
+
 // Start starts a stopped task.
 func (b *Backend) Start(ctx context.Context, h runtime.Handle) error {
 	return b.client.StartTask(ctx, h.ID, h.FIFODir)
