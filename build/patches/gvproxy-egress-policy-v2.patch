@@ -1,8 +1,8 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 16cbad4..4a653af 100644
+index 16cbad4..0a99b9e 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
-@@ -24,31 +24,32 @@ const (
+@@ -24,31 +24,33 @@ const (
  )
  
  type GvproxyArgs struct {
@@ -57,10 +57,11 @@ index 16cbad4..4a653af 100644
 +	ec2MetadataAccess   bool
 +	apiTokenFile        string
 +	requireEgressPolicy bool
++	requireOwnerLease   bool
  }
  
  type GvproxyConfig struct {
-@@ -62,13 +63,17 @@ type GvproxyConfig struct {
+@@ -62,13 +64,18 @@ type GvproxyConfig struct {
  		Stdio  string `yaml:"stdio,omitempty"`
  		Vfkit  string `yaml:"vfkit,omitempty"`
  	} `yaml:"interfaces,omitempty"`
@@ -79,13 +80,22 @@ index 16cbad4..4a653af 100644
 +	NotificationSocket  string                 `yaml:"notification,omitempty"`
 +	APITokenFile        string                 `yaml:"api-token-file,omitempty"`
 +	RequireEgressPolicy bool                   `yaml:"require-egress-policy,omitempty"`
++	RequireOwnerLease   bool                   `yaml:"-"`
 +	// ConfigPath is the file used for SIGHUP policy reloads. It is not part of
 +	// the serialized configuration.
 +	ConfigPath string `yaml:"-"`
  }
  
  type GvproxyConfigForward struct {
-@@ -116,6 +121,24 @@ func GvproxyInit() (*GvproxyConfig, error) {
+@@ -94,6 +101,7 @@ func GvproxyInit() (*GvproxyConfig, error) {
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to parse command line arguments: %w", err)
+ 	}
++	config.RequireOwnerLease = args.requireOwnerLease
+ 
+ 	if version.ShowVersion() {
+ 		fmt.Println(version.String())
+@@ -116,6 +124,24 @@ func GvproxyInit() (*GvproxyConfig, error) {
  	return GvproxyConfigure(&config, &args, version.String())
  }
  
@@ -110,15 +120,16 @@ index 16cbad4..4a653af 100644
  func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*GvproxyArgs, error) {
  	flagSet.StringVar(&args.config, "config", "", "Use configuration file with command line override")
  	flagSet.Var(&args.endpoints, "listen", "control endpoint")
-@@ -142,6 +165,7 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
+@@ -142,6 +168,8 @@ func GvproxyArgParse(flagSet *flag.FlagSet, args *GvproxyArgs, argv []string) (*
  	flagSet.BoolVar(&args.ec2MetadataAccess, "ec2-metadata-access", false, "Permits access to EC2 Metadata Service and Amazon Time Sync Service")
  	flagSet.StringVar(&args.notificationSocket, "notification", "", "Socket to be used to send network-ready notifications")
  	flagSet.StringVar(&args.apiTokenFile, "api-token-file", "", "Path to file where API token will be read from (needs 0600 permissions on macOS and Linux)")
 +	flagSet.BoolVar(&args.requireEgressPolicy, "require-egress-policy", false, "Fail closed unless the configuration contains an egressPolicy")
++	flagSet.BoolVar(&args.requireOwnerLease, "require-owner-lease", false, "Exit when owner lease on descriptor 3 closes")
  	if err := flagSet.Parse(argv); err != nil {
  		return nil, err
  	}
-@@ -313,6 +337,16 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
+@@ -313,6 +341,16 @@ func GvproxyConfigure(config *GvproxyConfig, args *GvproxyArgs, version string)
  	if args.apiTokenFile != "" {
  		config.APITokenFile = args.apiTokenFile
  	}
@@ -136,15 +147,38 @@ index 16cbad4..4a653af 100644
  	// Make sure the qemu socket provided is valid syntax
  	if config.Interfaces.Qemu != "" {
 diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
-index 21ab61e..cb7c7fb 100644
+index 21ab61e..3b1362c 100644
 --- a/cmd/gvproxy/main.go
 +++ b/cmd/gvproxy/main.go
-@@ -45,8 +45,10 @@ func main() {
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net"
+ 	"net/http"
+ 	"net/http/pprof"
+@@ -45,8 +46,25 @@ func main() {
  	log.Info(GvproxyVersion())
  
  	ctx, cancel := context.WithCancel(context.Background())
 -	// Make this the last defer statement in the stack
 -	defer log.Exit(exitCode)
++	if config.RequireOwnerLease {
++		lease := os.NewFile(3, "gateway-supervisor-lease")
++		if lease == nil {
++			log.Fatal("gateway supervisor lease is missing")
++		}
++		info, err := lease.Stat()
++		if err != nil || info.Mode()&os.ModeNamedPipe == 0 {
++			log.Fatal("gateway supervisor lease is invalid")
++		}
++		defer lease.Close()
++		go func() {
++			_, _ = io.Copy(io.Discard, lease)
++			cancel()
++		}()
++	}
 +	// Make this the last defer statement in the stack. The closure is required
 +	// because deferred arguments are evaluated immediately; log.Exit(exitCode)
 +	// would always observe the initial zero value and mask startup failures.
@@ -152,7 +186,7 @@ index 21ab61e..cb7c7fb 100644
  
  	// Create a PID file if requested
  	if config.PIDFile != "" {
-@@ -118,7 +120,7 @@ func InDebugMode() bool {
+@@ -118,7 +136,7 @@ func InDebugMode() bool {
  }
  
  func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
@@ -161,7 +195,7 @@ index 21ab61e..cb7c7fb 100644
  	if err != nil {
  		return err
  	}
-@@ -131,6 +133,34 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
+@@ -131,6 +149,34 @@ func run(ctx context.Context, g *errgroup.Group, config *GvproxyConfig) error {
  		return err
  	})
  
@@ -261,6 +295,111 @@ index aeeb976..eda8b38 100644
  	}
  	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}, nil
  }
+diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
+index 53b4f1e..0dacf73 100644
+--- a/pkg/services/dns/dns_test.go
++++ b/pkg/services/dns/dns_test.go
+@@ -199,7 +199,10 @@ var _ = ginkgo.Describe("dns add test", func() {
+ 		}))
+ 	})
+ 
+-	ginkgo.It("Should pass DNS requests to default system DNS server", func() {
++	ginkgo.It("forwards DNS requests to the configured upstream resolver", func() {
++		server.handler.upstream = &mockdns.Resolver{Zones: map[string]mockdns.Zone{
++			"fixture.test.": {A: []string{"192.0.2.42"}},
++		}}
+ 		m := &dns.Msg{
+ 			MsgHdr: dns.MsgHdr{
+ 				Authoritative:     false,
+@@ -212,15 +215,16 @@ var _ = ginkgo.Describe("dns add test", func() {
+ 		}
+ 
+ 		m.Question[0] = dns.Question{
+-			Name:   "redhat.com.",
++			Name:   "fixture.test.",
+ 			Qtype:  1,
+ 			Qclass: 1,
+ 		}
+ 
+ 		server.handler.addAnswers(m)
+ 
+-		gomega.Expect(m.Answer[0].Header().Name).To(gomega.Equal("redhat.com."))
+-		gomega.Expect(m.Answer[0].String()).To(gomega.SatisfyAny(gomega.ContainSubstring("34.235.198.240"), gomega.ContainSubstring("52.200.142.250")))
++		gomega.Expect(m.Answer).To(gomega.HaveLen(1))
++		gomega.Expect(m.Answer[0].Header().Name).To(gomega.Equal("fixture.test."))
++		gomega.Expect(m.Answer[0].String()).To(gomega.ContainSubstring("192.0.2.42"))
+ 	})
+ 
+ 	ginkgo.It("should match existing zones case-insensitively", func() {
+@@ -678,8 +682,8 @@ func TestDNS(t *testing.T) {
+ 
+ 	upstream := &mockdns.Resolver{
+ 		Zones: map[string]mockdns.Zone{
+-			"redhat.com.": {
+-				A: []string{"52.200.142.250", "34.235.198.240"},
++			"fixture.test.": {
++				A: []string{"192.0.2.42", "192.0.2.43"},
+ 			},
+ 		},
+ 	}
+@@ -701,38 +705,36 @@ func TestDNS(t *testing.T) {
+ 			return d.DialContext(ctx, network, nameserver)
+ 		},
+ 	}
+-	redhatdotcom := ARecord{
+-		name:        "redhat.com",
+-		expectedIPs: []string{"52.200.142.250"},
++	fixture := ARecord{
++		name:        "fixture.test",
++		expectedIPs: []string{"192.0.2.42", "192.0.2.43"},
+ 	}
+-	record := redhatdotcom
++	record := fixture
+ 	{
+ 		log.Infof("looking up %s", record.name)
+ 		ipGvisor, err := r.LookupHost(context.Background(), record.name)
+ 		require.NoError(t, err)
+-		require.Subset(t, ipGvisor, record.expectedIPs)
++		require.ElementsMatch(t, record.expectedIPs, ipGvisor)
+ 		log.Infof("ip gvisor: %+v", ipGvisor)
+-
+-		ipGo, err := net.LookupHost(record.name)
+-		require.NoError(t, err)
+-		log.Infof("ip go: %+v", ipGo)
+-		require.Subset(t, ipGvisor, ipGo)
+ 	}
+ }
+ 
+ func startDNSServer(upstream upstreamResolver) (string, func(), error) {
+-	udpConn, err := net.ListenPacket("udp", "127.0.0.1:5354")
++	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+ 	if err != nil {
+ 		return "", nil, err
+ 	}
+ 
+-	tcpLn, err := net.Listen("tcp", "127.0.0.1:5354")
++	tcpLn, err := net.Listen("tcp", udpConn.LocalAddr().String())
+ 	if err != nil {
++		_ = udpConn.Close()
+ 		return "", nil, err
+ 	}
+ 
+ 	server, err := NewWithUpstreamResolver(udpConn, tcpLn, nil, upstream)
+ 	if err != nil {
++		_ = udpConn.Close()
++		_ = tcpLn.Close()
+ 		return "", nil, err
+ 	}
+ 
+@@ -746,7 +748,7 @@ func startDNSServer(upstream upstreamResolver) (string, func(), error) {
+ 			log.Errorf("serve TCP error: %T %s", err, err)
+ 		}
+ 	}()
+-	return "127.0.0.1:5354", func() {
++	return udpConn.LocalAddr().String(), func() {
+ 		udpConn.Close()
+ 		tcpLn.Close()
+ 	}, nil
 diff --git a/pkg/services/dns/egress_policy_test.go b/pkg/services/dns/egress_policy_test.go
 new file mode 100644
 index 0000000..f720f19
