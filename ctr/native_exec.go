@@ -111,7 +111,7 @@ func (b *Backend) execNative(ctx context.Context, h runtime.Handle, interactive 
 		return 0, fmt.Errorf("wait guest process: %w", err)
 	}
 	if err := process.Start(ctx); err != nil {
-		if code, handled := startErrorCode(req.Stderr, err); handled {
+		if code, handled := startErrorCode(req.Stdout, err); handled {
 			return code, nil
 		}
 		return 0, fmt.Errorf("start guest process: %w", err)
@@ -123,13 +123,13 @@ func (b *Backend) execNative(ctx context.Context, h runtime.Handle, interactive 
 	return waitNativeExec(controlCtx, status, process.IO(), stdout, stderr)
 }
 
-func startErrorCode(stderr io.Writer, err error) (int, bool) {
+func startErrorCode(output io.Writer, err error) (int, bool) {
 	code, message, ok := classifyStartError(err)
 	if !ok {
 		return 0, false
 	}
-	if stderr != nil {
-		_, _ = io.WriteString(stderr, message+"\n")
+	if output != nil {
+		_, _ = io.WriteString(output, message+"\n")
 	}
 	return code, true
 }
@@ -140,7 +140,7 @@ func classifyStartError(err error) (int, string, bool) {
 	case strings.Contains(message, "not found in $PATH"):
 		return 127, message, true
 	case strings.Contains(message, "exists but it is not executable"):
-		return 126, message, true
+		return 127, message, true
 	default:
 		return 0, "", false
 	}
