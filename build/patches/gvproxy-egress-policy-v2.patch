@@ -1,5 +1,5 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 16cbad4..0a99b9e 100644
+index 16cbad47..0a99b9e7 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
 @@ -24,31 +24,33 @@ const (
@@ -147,7 +147,7 @@ index 16cbad4..0a99b9e 100644
  	// Make sure the qemu socket provided is valid syntax
  	if config.Interfaces.Qemu != "" {
 diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
-index 21ab61e..3b1362c 100644
+index 21ab61ee..3b1362c4 100644
 --- a/cmd/gvproxy/main.go
 +++ b/cmd/gvproxy/main.go
 @@ -5,6 +5,7 @@ import (
@@ -231,7 +231,7 @@ index 21ab61e..3b1362c 100644
  	apiToken, err := tokenauth.ReadToken(config.APITokenFile)
  	if err != nil {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index aeeb976..eda8b38 100644
+index aeeb9766..eda8b388 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
 @@ -28,9 +28,10 @@ type upstreamResolver interface {
@@ -296,7 +296,7 @@ index aeeb976..eda8b38 100644
  	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}, nil
  }
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
-index 53b4f1e..0dacf73 100644
+index 53b4f1e3..0dacf732 100644
 --- a/pkg/services/dns/dns_test.go
 +++ b/pkg/services/dns/dns_test.go
 @@ -199,7 +199,10 @@ var _ = ginkgo.Describe("dns add test", func() {
@@ -402,7 +402,7 @@ index 53b4f1e..0dacf73 100644
  	}, nil
 diff --git a/pkg/services/dns/egress_policy_test.go b/pkg/services/dns/egress_policy_test.go
 new file mode 100644
-index 0000000..f720f19
+index 00000000..f720f19b
 --- /dev/null
 +++ b/pkg/services/dns/egress_policy_test.go
 @@ -0,0 +1,38 @@
@@ -445,7 +445,7 @@ index 0000000..f720f19
 +	}
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index 6a1f548..3532b55 100644
+index 6a1f548a..19fc26d9 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -7,6 +7,7 @@ import (
@@ -465,22 +465,36 @@ index 6a1f548..3532b55 100644
  	if maxInFlight <= 0 {
  		maxInFlight = defaultTCPMaxInFlight
  	}
-@@ -43,12 +44,26 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
- 			localAddress = replaced
- 		}
- 		natLock.Unlock()
-+		if !policy.Allows("tcp", localAddress.String(), r.ID().LocalPort) {
-+			log.Debugf("egress policy denied tcp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
-+			r.Complete(true)
-+			return
-+		}
- 		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
- 		if err != nil {
- 			log.Tracef("net.DialTimeout() = %v", err)
+@@ -31,13 +32,22 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 		connectTimeout = defaultTCPConnectTimeout
+ 	}
+ 	return tcp.NewForwarder(s, 0, maxInFlight, func(r *tcp.ForwarderRequest) {
+-		localAddress := r.ID().LocalAddress
++		guestAddress := r.ID().LocalAddress
+ 
+-		if (!ec2MetadataAccess) && linkLocal().Contains(localAddress) {
++		if (!ec2MetadataAccess) && linkLocal().Contains(guestAddress) {
  			r.Complete(true)
  			return
  		}
-+		flowID := policy.Track("tcp", localAddress.String(), r.ID().LocalPort, outbound)
+ 
++		// Evaluate policy against the guest-visible destination before NAT.
++		// The host virtual IP is translated to loopback for dialing, but rules
++		// and audit must describe the address the sandbox actually targeted.
++		if !policy.Allows("tcp", guestAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied tcp %s:%d revision=%s", guestAddress, r.ID().LocalPort, policy.Revision())
++			r.Complete(true)
++			return
++		}
++		localAddress := guestAddress
+ 		natLock.Lock()
+ 		if replaced, ok := nat[localAddress]; ok {
+ 			localAddress = replaced
+@@ -49,6 +59,15 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			r.Complete(true)
+ 			return
+ 		}
++		flowID := policy.Track("tcp", guestAddress.String(), r.ID().LocalPort, outbound)
 +		if flowID == 0 && policy.Enabled() {
 +			_ = outbound.Close()
 +			r.Complete(true)
@@ -493,7 +507,7 @@ index 6a1f548..3532b55 100644
  		var wq waiter.Queue
  		ep, tcpErr := r.CreateEndpoint(&wq)
 diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
-index 1269449..eb985d5 100644
+index 12694496..4e8b440e 100644
 --- a/pkg/services/forwarder/udp.go
 +++ b/pkg/services/forwarder/udp.go
 @@ -5,6 +5,7 @@ import (
@@ -504,31 +518,35 @@ index 1269449..eb985d5 100644
  	log "github.com/sirupsen/logrus"
  	"gvisor.dev/gvisor/pkg/tcpip"
  	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-@@ -14,7 +15,7 @@ import (
+@@ -14,14 +15,20 @@ import (
  	"gvisor.dev/gvisor/pkg/waiter"
  )
  
 -func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *udp.Forwarder {
 +func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, policy *types.EgressPolicyHolder) *udp.Forwarder {
  	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
- 		localAddress := r.ID().LocalAddress
+-		localAddress := r.ID().LocalAddress
++		guestAddress := r.ID().LocalAddress
  
-@@ -27,6 +28,10 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
- 			localAddress = replaced
+-		if (!ec2MetadataAccess) && linkLocal().Contains(localAddress) || (localAddress == header.IPv4Broadcast) {
++		if (!ec2MetadataAccess) && linkLocal().Contains(guestAddress) || (guestAddress == header.IPv4Broadcast) {
+ 			return true
  		}
- 		natLock.Unlock()
-+		if !policy.Allows("udp", localAddress.String(), r.ID().LocalPort) {
-+			log.Debugf("egress policy denied udp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
+ 
++		// Evaluate policy against the guest-visible destination before NAT.
++		if !policy.Allows("udp", guestAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied udp %s:%d revision=%s", guestAddress, r.ID().LocalPort, policy.Revision())
 +			return true
 +		}
- 
- 		var wq waiter.Queue
- 		ep, tcpErr := r.CreateEndpoint(&wq)
-@@ -43,7 +48,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
++		localAddress := guestAddress
+ 		natLock.Lock()
+ 		if replaced, ok := nat[localAddress]; ok {
+ 			localAddress = replaced
+@@ -43,7 +50,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
  		p, _ := NewUDPProxy(&autoStoppingListener{underlying: gonet.NewUDPConn(&wq, ep)}, func(_ net.Addr) (net.Conn, error) {
  			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
  		})
-+		flowID := policy.Track("udp", localAddress.String(), r.ID().LocalPort, p)
++		flowID := policy.Track("udp", guestAddress.String(), r.ID().LocalPort, p)
 +		if flowID == 0 && policy.Enabled() {
 +			_ = p.Close()
 +			return true
@@ -541,7 +559,7 @@ index 1269449..eb985d5 100644
  
  			// note that at this point packets that are sent to the current forwarder session
 diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
-index 613b32a..37964e2 100644
+index 613b32a1..37964e24 100644
 --- a/pkg/types/configuration.go
 +++ b/pkg/types/configuration.go
 @@ -34,6 +34,11 @@ type Configuration struct {
@@ -569,7 +587,7 @@ index 613b32a..37964e2 100644
  type Protocol string
 diff --git a/pkg/types/egress_policy.go b/pkg/types/egress_policy.go
 new file mode 100644
-index 0000000..ba3415b
+index 00000000..ba3415be
 --- /dev/null
 +++ b/pkg/types/egress_policy.go
 @@ -0,0 +1,432 @@
@@ -1007,7 +1025,7 @@ index 0000000..ba3415b
 +}
 diff --git a/pkg/types/egress_policy_test.go b/pkg/types/egress_policy_test.go
 new file mode 100644
-index 0000000..41bea30
+index 00000000..41bea302
 --- /dev/null
 +++ b/pkg/types/egress_policy_test.go
 @@ -0,0 +1,259 @@
@@ -1271,7 +1289,7 @@ index 0000000..41bea30
 +	}
 +}
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index 3ed9a99..f9ca825 100644
+index 3ed9a996..f9ca8250 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
 @@ -1,6 +1,7 @@
@@ -1340,7 +1358,7 @@ index 3ed9a99..f9ca825 100644
  		return nil, err
  	}
 diff --git a/pkg/virtualnetwork/virtualnetwork.go b/pkg/virtualnetwork/virtualnetwork.go
-index b2b4461..5f4ac70 100644
+index b2b44614..5f4ac70d 100644
 --- a/pkg/virtualnetwork/virtualnetwork.go
 +++ b/pkg/virtualnetwork/virtualnetwork.go
 @@ -30,6 +30,7 @@ type VirtualNetwork struct {
