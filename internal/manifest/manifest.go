@@ -48,6 +48,10 @@ func Load(path string) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, err
 	}
+	return parseManifest(data)
+}
+
+func parseManifest(data []byte) (Manifest, error) {
 	var m Manifest
 	if err := yaml.Unmarshal(data, &m); err != nil {
 		return Manifest{}, fmt.Errorf("parse manifest: %w", err)

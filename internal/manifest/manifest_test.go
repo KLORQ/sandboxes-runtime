@@ -17,6 +17,15 @@ func TestRepositoryManifest(t *testing.T) {
 	}
 }
 
+func FuzzParseManifest(f *testing.F) {
+	f.Add([]byte("version: 1\nplatforms: [linux/arm64]\n"))
+	f.Add([]byte("components: ["))
+	f.Add([]byte(""))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = parseManifest(data)
+	})
+}
+
 func TestVerifyRejectsMissingPatch(t *testing.T) {
 	root := t.TempDir()
 	m := Manifest{

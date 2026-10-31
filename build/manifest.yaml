@@ -19,11 +19,7 @@ components:
 patches:
   gvproxy-egress-policy:
     file: patches/gvproxy-egress-policy-v2.patch
-    sha256: dd5907fb04acb41b8c7f9fe7a3f7c963be2db17de1d8cac4ad261e093079e41c
-    status: experimental
-  nerdbox-cgroup-caps:
-    file: patches/nerdbox-klorq-cgroup-caps.patch
-    sha256: efcd345c96360693cd8f347eedeb33ddcc048f5bed8e9673eebe46c83a299dc4
+    sha256: af74676392734fd0511f2ddf523f4228c59a44da4aee1470190fc76bf673227e
     status: experimental
 images:
   default:
