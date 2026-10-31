@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+const taskRunning = "RUNNING"
+const taskStopped = "STOPPED"
+
 // Runner executes ctr commands. Tests can replace it with a fake.
 type Runner interface {
 	CombinedOutput(ctx context.Context, name string, args ...string) ([]byte, error)
@@ -68,20 +71,44 @@ func (c *Client) EnsureImage(ctx context.Context, image string) error {
 
 // ContainerExists reports whether a container exists.
 func (c *Client) ContainerExists(ctx context.Context, id string) bool {
+	found, _ := c.containerExists(ctx, id)
+	return found
+}
+
+func (c *Client) containerExists(ctx context.Context, id string) (bool, error) {
 	out, err := c.run(ctx, "containers", "ls", "-q")
 	if err != nil {
-		return false
+		return false, err
 	}
-	return containsLine(out, id)
+	return containsLine(out, id), nil
 }
 
 // TaskRunning reports whether a task is running.
 func (c *Client) TaskRunning(ctx context.Context, id string) bool {
-	out, err := c.run(ctx, "tasks", "ls", "-q")
+	status, _ := c.taskStatus(ctx, id)
+	return status == taskRunning
+}
+
+func (c *Client) taskStatus(ctx context.Context, id string) (string, error) {
+	out, err := c.run(ctx, "tasks", "ls")
 	if err != nil {
-		return false
+		return "", err
 	}
-	return containsLine(out, id)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	header := strings.Fields(lines[0])
+	if len(header) != 3 || header[0] != "TASK" || header[1] != "PID" || header[2] != "STATUS" {
+		return "", fmt.Errorf("invalid task list response")
+	}
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) != 3 {
+			return "", fmt.Errorf("invalid task status response")
+		}
+		if fields[0] == id {
+			return fields[2], nil
+		}
+	}
+	return "", nil
 }
 
 // Mount describes a bind mount.
@@ -148,38 +175,88 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) error {
 
 // StartTask starts a stopped task.
 func (c *Client) StartTask(ctx context.Context, id, fifoDir string) error {
+	status, err := c.taskStatus(ctx, id)
+	if err != nil {
+		return fmt.Errorf("inspect task before start: %w", err)
+	}
+	switch status {
+	case taskRunning:
+		return nil
+	case taskStopped:
+		if err := c.DeleteTask(ctx, id); err != nil {
+			return fmt.Errorf("remove stopped task before start: %w", err)
+		}
+	case "":
+	default:
+		return fmt.Errorf("cannot start task in state %q", status)
+	}
 	args := []string{"tasks", "start", "-d"}
 	if fifoDir != "" {
 		args = append(args, "--fifo-dir", fifoDir)
 	}
 	args = append(args, id)
-	_, err := c.run(ctx, args...)
+	_, err = c.run(ctx, args...)
 	return err
 }
 
 // StopTask terminates a task and waits for the grace period.
 func (c *Client) StopTask(ctx context.Context, id string, grace time.Duration) error {
-	if !c.TaskRunning(ctx, id) {
-		_, _ = c.run(ctx, "tasks", "delete", "-f", id)
+	status, err := c.taskStatus(ctx, id)
+	if err != nil {
+		return fmt.Errorf("inspect task: %w", err)
+	}
+	if status == "" {
 		return nil
 	}
-	_, _ = c.run(ctx, "tasks", "kill", "-s", "SIGTERM", id)
+	if status == taskStopped {
+		return c.DeleteTask(ctx, id)
+	}
+	if status != taskRunning {
+		return fmt.Errorf("cannot stop task in state %q", status)
+	}
+	if _, err := c.run(ctx, "tasks", "kill", "-s", "SIGTERM", id); err != nil {
+		return fmt.Errorf("signal task: %w", err)
+	}
+	status, err = c.waitTaskStop(ctx, id, grace)
+	if err != nil {
+		return err
+	}
+	if status == taskRunning {
+		if _, err := c.run(ctx, "tasks", "kill", "-s", "SIGKILL", id); err != nil {
+			return fmt.Errorf("kill task: %w", err)
+		}
+	}
+	if status == "" {
+		return nil
+	}
+	if _, err := c.run(ctx, "tasks", "delete", "-f", id); err != nil {
+		return fmt.Errorf("delete task: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) waitTaskStop(ctx context.Context, id string, grace time.Duration) (string, error) {
+	status := taskRunning
 	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {
-		if !c.TaskRunning(ctx, id) {
+		var err error
+		status, err = c.taskStatus(ctx, id)
+		if err != nil {
+			return "", fmt.Errorf("inspect task: %w", err)
+		}
+		if status == "" || status == taskStopped {
 			break
+		}
+		if status != taskRunning {
+			return "", fmt.Errorf("cannot stop task in state %q", status)
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if c.TaskRunning(ctx, id) {
-		_, _ = c.run(ctx, "tasks", "kill", "-s", "SIGKILL", id)
-	}
-	_, _ = c.run(ctx, "tasks", "delete", "-f", id)
-	return nil
+	return status, nil
 }
 
 // DeleteTask removes a task if present.

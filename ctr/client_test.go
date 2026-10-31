@@ -3,8 +3,10 @@ package ctr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	runtime "github.com/KLORQ/sandboxes-runtime"
 )
@@ -12,6 +14,172 @@ import (
 type fakeRunner struct {
 	calls [][]string
 	fn    func(args []string) ([]byte, error)
+}
+
+func TestStartTaskHandlesExistingTask(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     string
+		wantDelete bool
+		wantStart  bool
+		wantErr    bool
+	}{
+		{name: "absent", wantStart: true},
+		{name: "running", status: "RUNNING"},
+		{name: "stopped", status: "STOPPED", wantDelete: true, wantStart: true},
+		{name: "paused", status: "PAUSED", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+				if strings.Contains(strings.Join(args, " "), "tasks ls") {
+					result := "TASK PID STATUS\n"
+					if tc.status != "" {
+						result += "klorq-dev 12 " + tc.status + "\n"
+					}
+					return []byte(result), nil
+				}
+				return nil, nil
+			}}
+			err := newTestClient(t, runner).StartTask(context.Background(), "klorq-dev", "/tmp/fifo")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			calls := fmt.Sprint(runner.calls)
+			if strings.Contains(calls, "tasks delete -f klorq-dev") != tc.wantDelete ||
+				strings.Contains(calls, "tasks start -d --fifo-dir /tmp/fifo klorq-dev") != tc.wantStart {
+				t.Fatalf("unexpected calls: %s", calls)
+			}
+		})
+	}
+}
+
+func TestStartTaskStopsOnInspectionOrDeleteFailure(t *testing.T) {
+	for _, failDelete := range []bool{false, true} {
+		runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+			if failDelete && strings.Contains(strings.Join(args, " "), "tasks ls") {
+				return []byte("TASK PID STATUS\nklorq-dev 12 STOPPED\n"), nil
+			}
+			return nil, errors.New("containerd unavailable")
+		}}
+		if err := newTestClient(t, runner).StartTask(context.Background(), "klorq-dev", ""); err == nil {
+			t.Fatal("failure was ignored")
+		}
+		if strings.Contains(fmt.Sprint(runner.calls), "tasks start") {
+			t.Fatal("started after failure")
+		}
+	}
+}
+
+func TestStopTaskReportsContainerdFailures(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		fn   func([]string) ([]byte, error)
+	}{
+		{"list", func([]string) ([]byte, error) { return nil, errors.New("containerd unavailable") }},
+		{"signal", func(args []string) ([]byte, error) {
+			if strings.Contains(strings.Join(args, " "), "tasks ls") {
+				return []byte("TASK PID STATUS\nklorq-dev 12 RUNNING\n"), nil
+			}
+			return nil, errors.New("signal failed")
+		}},
+		{"delete", func(args []string) ([]byte, error) {
+			if strings.Contains(strings.Join(args, " "), "tasks ls") {
+				return []byte("TASK PID STATUS\nklorq-dev 12 STOPPED\n"), nil
+			}
+			return nil, errors.New("delete failed")
+		}},
+		{"unknown state", func([]string) ([]byte, error) {
+			return []byte("TASK PID STATUS\nklorq-dev 12 PAUSED\n"), nil
+		}},
+		{"malformed", func([]string) ([]byte, error) {
+			return []byte("TASK PID STATUS\nklorq-dev\n"), nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t, &fakeRunner{fn: test.fn})
+			if err := client.StopTask(context.Background(), "klorq-dev", time.Second); err == nil {
+				t.Fatal("failure was reported as successful stop")
+			}
+		})
+	}
+}
+
+func TestStopTaskSignalsAndDeletesStoppedTask(t *testing.T) {
+	lists := 0
+	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "tasks ls") {
+			lists++
+			if lists == 1 {
+				return []byte("TASK PID STATUS\nklorq-dev 12 RUNNING\n"), nil
+			}
+			return []byte("TASK PID STATUS\nklorq-dev 12 STOPPED\n"), nil
+		}
+		return nil, nil
+	}}
+	client := newTestClient(t, runner)
+	if err := client.StopTask(context.Background(), "klorq-dev", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	calls := make([]string, 0, len(runner.calls))
+	for _, call := range runner.calls {
+		calls = append(calls, strings.Join(call, " "))
+	}
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "tasks kill -s SIGTERM klorq-dev") || !strings.Contains(joined, "tasks delete -f klorq-dev") || strings.Contains(joined, "SIGKILL") {
+		t.Fatalf("unexpected stop commands: %s", joined)
+	}
+}
+
+func TestCreateDoesNotProceedWhenContainerListFails(t *testing.T) {
+	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "images ls") {
+			return []byte("alpine:3.22\n"), nil
+		}
+		return nil, errors.New("containerd unavailable")
+	}}
+	client := newTestClient(t, runner)
+	backend := &Backend{client: client, image: "alpine:3.22"}
+	if _, err := backend.Create(context.Background(), runtime.Config{Name: "dev"}); err == nil {
+		t.Fatal("container list failure was ignored")
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("runtime continued after failed list: %d calls", len(runner.calls))
+	}
+}
+
+func TestBackendDeleteAfterTaskHasStopped(t *testing.T) {
+	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		switch {
+		case strings.Contains(strings.Join(args, " "), "tasks ls"):
+			return []byte("TASK PID STATUS\n"), nil
+		case strings.Contains(strings.Join(args, " "), "containers ls"):
+			return []byte("klorq-dev\n"), nil
+		case strings.Contains(strings.Join(args, " "), "containers delete"):
+			return nil, nil
+		default:
+			return nil, errors.New("unexpected command")
+		}
+	}}
+	backend := &Backend{client: newTestClient(t, runner)}
+	if err := backend.Delete(context.Background(), runtime.Handle{ID: "klorq-dev"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("unexpected delete sequence: %v", runner.calls)
+	}
+}
+
+func TestBackendDeleteFailsWhenTaskListUnavailable(t *testing.T) {
+	runner := &fakeRunner{fn: func([]string) ([]byte, error) {
+		return nil, errors.New("containerd unavailable")
+	}}
+	backend := &Backend{client: newTestClient(t, runner)}
+	if err := backend.Delete(context.Background(), runtime.Handle{ID: "klorq-dev"}); err == nil {
+		t.Fatal("task inspection failure ignored")
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("delete proceeded after inspection failure: %v", runner.calls)
+	}
 }
 
 func (f *fakeRunner) CombinedOutput(_ context.Context, name string, args ...string) ([]byte, error) {
@@ -143,29 +311,94 @@ func TestBackendHandle(t *testing.T) {
 }
 
 type fakeNetwork struct {
-	started int
-	stopped int
+	started    int
+	ports      []runtime.Port
+	allow      []runtime.Rule
+	deny       []runtime.Rule
+	stopped    int
+	stopErr    error
+	stopCtxErr error
 }
 
-func (f *fakeNetwork) Start(context.Context, string) (runtime.NetworkAttachment, error) {
+func (f *fakeNetwork) Start(_ context.Context, _ string, ports []runtime.Port, allow, deny []runtime.Rule) (runtime.NetworkAttachment, error) {
 	f.started++
+	f.ports = append([]runtime.Port(nil), ports...)
+	f.allow = append([]runtime.Rule(nil), allow...)
+	f.deny = append([]runtime.Rule(nil), deny...)
 	return runtime.NetworkAttachment{Annotations: []string{"io.containerd.nerdbox.network.0=test"}}, nil
 }
-func (f *fakeNetwork) Stop(context.Context, string) error { f.stopped++; return nil }
+func (f *fakeNetwork) UpdatePolicy(context.Context, string, []runtime.Port, []runtime.Rule, []runtime.Rule, int) error {
+	return nil
+}
+
+func (f *fakeNetwork) UpdatePorts(context.Context, string, []runtime.Port) error { return nil }
+
+func (f *fakeNetwork) Stop(ctx context.Context, _ string) error {
+	f.stopped++
+	f.stopCtxErr = ctx.Err()
+	return f.stopErr
+}
+
+func TestCreateReportsNetworkCleanupFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := errors.New("synthetic run failure")
+	cleanupErr := errors.New("synthetic network cleanup failure")
+	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), " run --detach") {
+			cancel()
+			return nil, runErr
+		}
+		return nil, nil
+	}}
+	network := &fakeNetwork{stopErr: cleanupErr}
+	backend := &Backend{client: newTestClient(t, runner), image: "alpine:3.22", network: network}
+	_, err := backend.Create(ctx, runtime.Config{Name: "dev"})
+	if !errors.Is(err, runErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("runtime and cleanup errors not preserved: %v", err)
+	}
+	if network.stopped != 1 || network.stopCtxErr != nil {
+		t.Fatalf("network cleanup did not use a live context: %+v", network)
+	}
+}
+
+func TestStopReportsBothTaskAndNetworkFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	taskErr := errors.New("synthetic task inspection failure")
+	networkErr := errors.New("synthetic network stop failure")
+	runner := &fakeRunner{fn: func([]string) ([]byte, error) { return nil, taskErr }}
+	network := &fakeNetwork{stopErr: networkErr}
+	backend := &Backend{client: newTestClient(t, runner), network: network}
+	err := backend.Stop(ctx, runtime.Handle{ID: "klorq-dev"}, time.Second)
+	if !errors.Is(err, taskErr) || !errors.Is(err, networkErr) {
+		t.Fatalf("one of the stop failures was hidden: %v", err)
+	}
+	if network.stopped != 1 || network.stopCtxErr != nil {
+		t.Fatalf("network cleanup did not use a live context: %+v", network)
+	}
+}
 
 func TestBackendNetworkAnnotations(t *testing.T) {
 	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "tasks ls") {
+			return []byte("TASK PID STATUS\n"), nil
+		}
 		return nil, nil
 	}}
 	client := newTestClient(t, runner)
 	network := &fakeNetwork{}
 	backend := &Backend{client: client, image: "alpine:3.22", network: network}
-	handle, err := backend.Create(context.Background(), runtime.Config{Name: "dev"})
+	handle, err := backend.Create(context.Background(), runtime.Config{
+		Name: "dev", Ports: []runtime.Port{{Host: 8080, Guest: 3000, Protocol: "tcp"}},
+		Allow: []runtime.Rule{{Protocol: "tcp", CIDR: "0.0.0.0/0", Port: 80}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if network.started != 1 {
-		t.Fatalf("network starts = %d", network.started)
+	if network.started != 1 || len(network.ports) != 1 || network.ports[0].Host != 8080 ||
+		len(network.allow) != 1 || network.allow[0].Port != 80 {
+		t.Fatalf("network starts=%d ports=%+v allow=%+v", network.started, network.ports, network.allow)
 	}
 	joined := strings.Join(runner.calls[len(runner.calls)-1], " ")
 	if !strings.Contains(joined, "io.containerd.nerdbox.network.0=test") {
