@@ -2,6 +2,7 @@ package ctr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -60,13 +61,17 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 		return runtime.Handle{}, err
 	}
 	id := ContainerID(cfg.Name)
-	if b.client.ContainerExists(ctx, id) {
+	exists, err := b.client.containerExists(ctx, id)
+	if err != nil {
+		return runtime.Handle{}, fmt.Errorf("inspect container: %w", err)
+	}
+	if exists {
 		return runtime.Handle{}, fmt.Errorf("container %s already exists", id)
 	}
 	var attachment runtime.NetworkAttachment
 	if b.network != nil {
 		var err error
-		attachment, err = b.network.Start(ctx, cfg.Name)
+		attachment, err = b.network.Start(ctx, cfg.Name, cfg.Ports, cfg.Allow, cfg.Deny)
 		if err != nil {
 			return runtime.Handle{}, err
 		}
@@ -80,12 +85,16 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 		FIFODir:     fifoDir,
 		Annotations: append([]string(nil), attachment.Annotations...),
 	}
-	if cfg.Workspace != "" {
-		spec.Mounts = append(spec.Mounts, Mount{Source: cfg.Workspace, Destination: cfg.Workspace})
+	workspaces := cfg.Workspaces
+	if len(workspaces) == 0 && cfg.Workspace != "" {
+		workspaces = []runtime.Workspace{{Path: cfg.Workspace}}
+	}
+	for _, workspace := range workspaces {
+		spec.Mounts = append(spec.Mounts, Mount{Source: workspace.Path, Destination: workspace.Path, ReadOnly: workspace.ReadOnly})
 	}
 	if err := b.client.Run(ctx, spec); err != nil {
 		if b.network != nil {
-			_ = b.network.Stop(ctx, cfg.Name)
+			return runtime.Handle{}, errors.Join(err, b.stopNetwork(ctx, cfg.Name))
 		}
 		return runtime.Handle{}, err
 	}
@@ -100,43 +109,69 @@ func (b *Backend) Handle(name string) runtime.Handle {
 // Start starts a stopped task.
 func (b *Backend) Start(ctx context.Context, h runtime.Handle) error {
 	if b.network != nil {
-		if _, err := b.network.Start(ctx, strings.TrimPrefix(h.ID, "klorq-")); err != nil {
+		if _, err := b.network.Start(ctx, strings.TrimPrefix(h.ID, "klorq-"), h.Ports, h.Allow, h.Deny); err != nil {
 			return err
 		}
 	}
 	if err := b.client.StartTask(ctx, h.ID, h.FIFODir); err != nil {
 		if b.network != nil {
-			_ = b.network.Stop(ctx, strings.TrimPrefix(h.ID, "klorq-"))
+			return errors.Join(err, b.stopNetwork(ctx, strings.TrimPrefix(h.ID, "klorq-")))
 		}
 		return err
 	}
 	return nil
 }
 
+func (b *Backend) stopNetwork(ctx context.Context, name string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := b.network.Stop(cleanupCtx, name); err != nil {
+		return fmt.Errorf("stop sandbox network: %w", err)
+	}
+	return nil
+}
+
 // Stop terminates a task.
+func (b *Backend) UpdatePolicy(ctx context.Context, h runtime.Handle, allow, deny []runtime.Rule, revision int) error {
+	if b.network == nil {
+		return errors.New("runtime has no network policy engine")
+	}
+	return b.network.UpdatePolicy(ctx, strings.TrimPrefix(h.ID, "klorq-"), h.Ports, allow, deny, revision)
+}
+
+func (b *Backend) UpdatePorts(ctx context.Context, h runtime.Handle, ports []runtime.Port) error {
+	if b.network == nil {
+		return errors.New("runtime has no network port engine")
+	}
+	return b.network.UpdatePorts(ctx, strings.TrimPrefix(h.ID, "klorq-"), ports)
+}
+
 func (b *Backend) Stop(ctx context.Context, h runtime.Handle, grace time.Duration) error {
 	if grace <= 0 {
 		grace = 5 * time.Second
 	}
 	err := b.client.StopTask(ctx, h.ID, grace)
 	if b.network != nil {
-		if stopErr := b.network.Stop(ctx, strings.TrimPrefix(h.ID, "klorq-")); err == nil {
-			err = stopErr
-		}
+		err = errors.Join(err, b.stopNetwork(ctx, strings.TrimPrefix(h.ID, "klorq-")))
 	}
 	return err
 }
 
 // Delete removes the task and container.
 func (b *Backend) Delete(ctx context.Context, h runtime.Handle) error {
-	err := b.client.DeleteTask(ctx, h.ID)
+	status, err := b.client.taskStatus(ctx, h.ID)
+	if err == nil && status != "" {
+		err = b.client.DeleteTask(ctx, h.ID)
+	}
 	if err == nil {
-		err = b.client.DeleteContainer(ctx, h.ID)
+		var exists bool
+		exists, err = b.client.containerExists(ctx, h.ID)
+		if err == nil && exists {
+			err = b.client.DeleteContainer(ctx, h.ID)
+		}
 	}
 	if b.network != nil {
-		if stopErr := b.network.Stop(ctx, strings.TrimPrefix(h.ID, "klorq-")); err == nil {
-			err = stopErr
-		}
+		err = errors.Join(err, b.stopNetwork(ctx, strings.TrimPrefix(h.ID, "klorq-")))
 	}
 	return err
 }

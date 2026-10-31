@@ -30,6 +30,11 @@ Current limits are explicit:
 
 - `Capabilities.Network` is `false` unless a `runtime.Network` implementation is supplied;
 - network annotations are wired through `runtime.Network`; the daemon supplies the gateway manager;
-- no exec/PTY yet;
+- non-interactive and interactive exec use separate adapter capabilities;
+  native execution requires cancellation-aware output and interactive input
+  requires an owned, closeable stream;
+- local guest user/group name resolution depends on guest tools and is not
+  a general NSS implementation; full signal and detach-key behavior is open;
 - no snapshots or GPU;
-- adapter is covered by command-construction tests, not a live VM test yet.
+- live VM validation is platform-specific and does not establish cross-platform
+  parity; fault and independent security reviews remain open.
