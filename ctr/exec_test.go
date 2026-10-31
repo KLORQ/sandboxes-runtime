@@ -153,12 +153,20 @@ func TestClassifyStartError(t *testing.T) {
 		ok      bool
 	}{
 		{"OCI runtime exec failed: executable file `missing` not found in $PATH: No such file or directory", 127, true},
-		{"OCI runtime exec failed: the path `/etc/passwd` exists but it is not executable: Operation not permitted", 126, true},
+		{"OCI runtime exec failed: the path `/etc/passwd` exists but it is not executable: Operation not permitted", 127, true},
 		{"synthetic unrelated start failure", 0, false},
 	} {
 		code, _, ok := classifyStartError(errors.New(tc.message))
 		if code != tc.code || ok != tc.ok {
 			t.Fatalf("classifyStartError(%q)=%d,%v want %d,%v", tc.message, code, ok, tc.code, tc.ok)
 		}
+	}
+}
+
+func TestStartErrorCodeWritesToStdoutContract(t *testing.T) {
+	var output bytes.Buffer
+	code, handled := startErrorCode(&output, errors.New("OCI runtime exec failed: executable file `missing` not found in $PATH"))
+	if !handled || code != 127 || !strings.Contains(output.String(), "not found in $PATH") {
+		t.Fatalf("code=%d handled=%v output=%q", code, handled, output.String())
 	}
 }
