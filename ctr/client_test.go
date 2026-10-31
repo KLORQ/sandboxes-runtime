@@ -212,6 +212,7 @@ func TestRunBuildsCommand(t *testing.T) {
 		MemoryMiB:   512,
 		FIFODir:     "/tmp/fifo",
 		Mounts:      []Mount{{Source: "/work", Destination: "/work"}},
+		Env:         []string{"PARITY=1"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -226,6 +227,7 @@ func TestRunBuildsCommand(t *testing.T) {
 		"--snapshotter erofs",
 		"--fifo-dir /tmp/fifo",
 		"type=bind,src=/work,dst=/work,options=rbind:rw",
+		"--env PARITY=1",
 		"alpine:3.22 klorq-dev /bin/sh -c",
 	} {
 		if !strings.Contains(args, want) {
@@ -282,9 +284,13 @@ func TestBackendCreate(t *testing.T) {
 		Workspace: "/work",
 		CPUs:      2,
 		MemoryMiB: 512,
+		Env:       []string{"PARITY=1"},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(runner.calls[len(runner.calls)-1], " "), "--env PARITY=1") {
+		t.Fatalf("env missing in %v", runner.calls)
 	}
 	if handle.ID != "klorq-dev" || handle.FIFODir != "/tmp/fifo" {
 		t.Fatalf("unexpected handle: %+v", handle)

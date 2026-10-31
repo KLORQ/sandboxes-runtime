@@ -48,6 +48,7 @@ type Config struct {
 	CPUs       uint8
 	MemoryMiB  uint32
 	FIFODir    string
+	Env        []string
 }
 
 // Handle identifies a runtime instance.
