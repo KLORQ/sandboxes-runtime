@@ -37,20 +37,27 @@ type Workspace struct {
 	ReadOnly bool
 }
 
+// BlockVolume is a preformatted ext4 image attached as a virtio block device.
+type BlockVolume struct {
+	Source      string
+	Destination string
+}
+
 // Config describes a VM create request.
 type Config struct {
-	Name       string
-	Image      string
-	Workspace  string
-	Workspaces []Workspace
-	Ports      []Port
-	Allow      []Rule
-	Deny       []Rule
-	CPUs       uint8
-	MemoryMiB  uint32
-	FIFODir    string
-	Env        []string
-	Privileged bool
+	Name         string
+	Image        string
+	Workspace    string
+	Workspaces   []Workspace
+	BlockVolumes []BlockVolume
+	Ports        []Port
+	Allow        []Rule
+	Deny         []Rule
+	CPUs         uint8
+	MemoryMiB    uint32
+	FIFODir      string
+	Env          []string
+	Privileged   bool
 }
 
 // Handle identifies a runtime instance.
@@ -126,6 +133,11 @@ type Executor interface {
 // an explicit user/environment through the native containerd API.
 type NativeExecutor interface {
 	ExecNative(ctx context.Context, h Handle, req ExecRequest) (int, error)
+}
+
+// ImageInspector exposes image configuration labels for Docker profile detection.
+type ImageInspector interface {
+	ImageLabels(ctx context.Context, image string) (map[string]string, error)
 }
 
 // ContextWriter writes output while honoring cancellation of ctx. Implementers

@@ -113,6 +113,7 @@ func (c *Client) taskStatus(ctx context.Context, id string) (string, error) {
 
 // Mount describes a bind mount.
 type Mount struct {
+	Type        string
 	Source      string
 	Destination string
 	ReadOnly    bool
@@ -294,6 +295,9 @@ func containsLine(out, want string) bool {
 }
 
 func mountSpec(m Mount) string {
+	if m.Type != "" && m.Type != "bind" {
+		return fmt.Sprintf("type=%s,src=%s,dst=%s", m.Type, m.Source, m.Destination)
+	}
 	options := "rbind:rw"
 	if m.ReadOnly {
 		options = "rbind:ro"

@@ -87,6 +87,9 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 		Privileged:  cfg.Privileged,
 		Annotations: append([]string(nil), attachment.Annotations...),
 	}
+	for _, volume := range cfg.BlockVolumes {
+		spec.Mounts = append(spec.Mounts, Mount{Type: "ext4", Source: volume.Source, Destination: volume.Destination})
+	}
 	workspaces := cfg.Workspaces
 	if len(workspaces) == 0 && cfg.Workspace != "" {
 		workspaces = []runtime.Workspace{{Path: cfg.Workspace}}
