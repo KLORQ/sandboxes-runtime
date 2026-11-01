@@ -1,0 +1,11 @@
+--- a/internal/shim/task/mount.go	2026-11-01 14:26:09.810420234 +0400
++++ b/internal/shim/task/mount.go	2026-11-01 14:26:09.813291954 +0400
+@@ -45,7 +45,7 @@
+ // devices total, some of which are reserved by the VM implementation) and
+ // lets the shim handle deep stacks of independent erofs mounts without
+ // coordinating layer offsets in the snapshotter.
+-const gptLayerThreshold = 8
++const gptLayerThreshold = 128
+ 
+ // diskAllocator assigns sequential virtio disk letters starting after any
+ // disks reserved by the VM implementation (see vm.Manager.ReservedDisks).

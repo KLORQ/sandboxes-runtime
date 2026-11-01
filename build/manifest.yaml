@@ -14,12 +14,16 @@ components:
     version: "1.19.6"
     source: https://github.com/containers/libkrun
   gvisor-tap-vsock:
-    commit: 1cd3f0426b07b3a683d47c671edff8ca261225db
+    commit: 0b0819c174331f5b86d96db3ab7aad7dd126078e
     source: https://github.com/containers/gvisor-tap-vsock
 patches:
+  nerdbox-gpt-threshold:
+    file: patches/nerdbox-gpt-threshold.patch
+    sha256: 251b1af0c07b915cf3b55f6440b73dbf1337dd371f4926b625ab4399df1fc091
+    status: experimental
   gvproxy-egress-policy:
     file: patches/gvproxy-egress-policy-v2.patch
-    sha256: 3d230897c9176f3f4cdb29591f0ad0de46b6e13dc63ece74a70921976b104e18
+    sha256: 20794276e94b1929ac59090407a2575248f2fae618d3b73838617724ed3362f2
     status: experimental
 images:
   default:

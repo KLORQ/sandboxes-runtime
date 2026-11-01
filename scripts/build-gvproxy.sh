@@ -1,0 +1,17 @@
+#!/bin/sh
+# Build the policy-enforcing gvproxy from a pinned upstream checkout.
+set -eu
+: "${GVPROXY_SRC:?set GVPROXY_SRC to the pinned gvisor-tap-vsock source tree}"
+: "${OUT:?set OUT to the gvproxy output path}"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/klorq-gvproxy-build.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT INT TERM
+cp -R "$GVPROXY_SRC" "$WORK/src"
+chmod -R u+w "$WORK/src"
+cd "$WORK/src"
+git apply "$ROOT/build/patches/gvproxy-egress-policy-v2.patch"
+GOWORK=off go build -o "$WORK/gvproxy" ./cmd/gvproxy
+mkdir -p "$(dirname -- "$OUT")"
+cp "$WORK/gvproxy" "$OUT"
+chmod 0755 "$OUT"
+shasum -a 256 "$OUT"
