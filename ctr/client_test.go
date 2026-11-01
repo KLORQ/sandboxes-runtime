@@ -229,7 +229,9 @@ func TestRunBuildsCommand(t *testing.T) {
 		"--fifo-dir /tmp/fifo",
 		"type=bind,src=/work,dst=/work,options=rbind:rw",
 		"--env PARITY=1",
-		"--privileged",
+		"--cap-add CAP_SYS_ADMIN",
+		"--cap-add CAP_NET_ADMIN",
+		"--cap-add CAP_NET_RAW",
 		"alpine:3.22 klorq-dev /bin/sh -c",
 	} {
 		if !strings.Contains(args, want) {
