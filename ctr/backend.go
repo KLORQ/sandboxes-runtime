@@ -26,6 +26,15 @@ type Backend struct {
 	network runtime.Network
 }
 
+// CreateWithProxy configures the optional guest helper while preserving the
+// stable runtime.Backend contract for consumers pinned to older releases.
+func (b *Backend) CreateWithProxy(ctx context.Context, cfg *runtime.Config, helperPath string, guestPort uint16, serviceHost string) (runtime.Handle, error) {
+	cfg.ProxyHelperPath = helperPath
+	cfg.ProxyGuestPort = guestPort
+	cfg.ProxyServiceHost = serviceHost
+	return b.Create(ctx, *cfg)
+}
+
 var _ runtime.Backend = (*Backend)(nil)
 
 // NewBackend creates a containerd-backed runtime.
