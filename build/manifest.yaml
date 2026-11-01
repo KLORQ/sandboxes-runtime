@@ -21,6 +21,10 @@ patches:
     file: patches/nerdbox-gpt-threshold.patch
     sha256: 251b1af0c07b915cf3b55f6440b73dbf1337dd371f4926b625ab4399df1fc091
     status: experimental
+  nerdbox-proxy-channel:
+    file: patches/nerdbox-proxy-channel.patch
+    sha256: 744b94aa6f857ea644fa8150b35dcc5eae3293fc976ba19422d584757f1f7af3
+    status: experimental
   gvproxy-egress-policy:
     file: patches/gvproxy-egress-policy-v2.patch
     sha256: f16f22755266b2f948b05816e9c087957d8df134e134749f6b1bb0d810446fe6

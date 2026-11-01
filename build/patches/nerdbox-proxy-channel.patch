@@ -1,0 +1,285 @@
+diff --git a/internal/shim/sandbox/sandbox.go b/internal/shim/sandbox/sandbox.go
+index d6c18b5..868342a 100644
+--- a/internal/shim/sandbox/sandbox.go
++++ b/internal/shim/sandbox/sandbox.go
+@@ -69,6 +69,7 @@ type NIC struct {
+ 
+ type Options struct {
+ 	Filesystems []Filesystem
++	Proxy       *ProxyChannel
+ 	Disks       []Disk
+ 	NICs        []NIC
+ 	StateDir    string
+@@ -77,6 +78,13 @@ type Options struct {
+ 	Memory      uint32 // in MiB
+ }
+ 
++// ProxyChannel describes a guest-initiated vsock port that libkrun connects
++// to a host unix socket. Ownership and authentication live on the host side.
++type ProxyChannel struct {
++	Port   uint32
++	Socket string
++}
++
+ type Opt func(*Options)
+ 
+ func WithFS(tag, mountPath string, readonly bool) Opt {
+@@ -89,6 +97,14 @@ func WithFS(tag, mountPath string, readonly bool) Opt {
+ 	}
+ }
+ 
++// WithProxyChannel registers a guest-dialed vsock port bridged to a host unix
++// socket. The VM implementation must support it and Start must not have run.
++func WithProxyChannel(port uint32, socket string) Opt {
++	return func(o *Options) {
++		o.Proxy = &ProxyChannel{Port: port, Socket: socket}
++	}
++}
++
+ func WithDisk(blockID, mountPath string, flags DiskFlags) Opt {
+ 	return func(o *Options) {
+ 		o.Disks = append(o.Disks, Disk{
+diff --git a/internal/shim/sandbox/vm/vm.go b/internal/shim/sandbox/vm/vm.go
+index 8d686fd..9e7b8f9 100644
+--- a/internal/shim/sandbox/vm/vm.go
++++ b/internal/shim/sandbox/vm/vm.go
+@@ -123,6 +123,18 @@ func (s *localsandbox) Start(ctx context.Context, opts ...sandbox.Opt) error {
+ 		return fmt.Errorf("both CPU and Memory must be set: %w", errdefs.ErrInvalidArgument)
+ 	}
+ 
++	if o.Proxy != nil {
++		adder, ok := vmi.(interface {
++			AddProxyChannel(context.Context, uint32, string) error
++		})
++		if !ok {
++			return fmt.Errorf("vm does not support a proxy channel: %w", errdefs.ErrNotImplemented)
++		}
++		if err := adder.AddProxyChannel(ctx, o.Proxy.Port, o.Proxy.Socket); err != nil {
++			return err
++		}
++	}
++
+ 	var startOpts []vm.StartOpt
+ 	if len(o.InitArgs) > 0 {
+ 		startOpts = append(startOpts, vm.WithInitArgs(o.InitArgs...))
+diff --git a/internal/shim/task/proxychannel.go b/internal/shim/task/proxychannel.go
+new file mode 100644
+index 0000000..143e12c
+--- /dev/null
++++ b/internal/shim/task/proxychannel.go
+@@ -0,0 +1,75 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++       http://www.apache.org/licenses/LICENSE-2.0
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package task
++
++import (
++	"errors"
++	"fmt"
++	"path/filepath"
++	"strconv"
++	"strings"
++
++	"github.com/containerd/nerdbox/internal/shim/sandbox"
++	"github.com/containerd/nerdbox/internal/shim/task/bundle"
++)
++
++// proxyChannelAnnotation configures an extra guest-dialed vsock port that
++// libkrun bridges to a host unix socket owned by the Klorq proxy broker.
++// The value is a comma-separated list of key=value fields:
++//
++//	io.klorq.proxy=port=1027,socket=/abs/path/proxy.sock
++//
++// The annotation is consumed by the shim and never forwarded into the guest.
++const proxyChannelAnnotation = "io.klorq.proxy"
++
++func proxyChannelFromBundle(b *bundle.Bundle) (*sandbox.ProxyChannel, error) {
++	value, ok := b.Spec.Annotations[proxyChannelAnnotation]
++	if !ok {
++		return nil, nil
++	}
++	delete(b.Spec.Annotations, proxyChannelAnnotation)
++	return parseProxyChannel(value)
++}
++
++func parseProxyChannel(value string) (*sandbox.ProxyChannel, error) {
++	var port uint32
++	var socket string
++	for _, field := range strings.Split(value, ",") {
++		key, raw, ok := strings.Cut(strings.TrimSpace(field), "=")
++		if !ok {
++			return nil, fmt.Errorf("invalid proxy channel field %q", field)
++		}
++		switch strings.TrimSpace(key) {
++		case "port":
++			parsed, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 32)
++			if err != nil {
++				return nil, fmt.Errorf("invalid proxy channel port: %w", err)
++			}
++			port = uint32(parsed)
++		case "socket":
++			socket = strings.TrimSpace(raw)
++		default:
++			return nil, fmt.Errorf("unknown proxy channel field %q", key)
++		}
++	}
++	// Ports below 1027 belong to the nerdbox shim (1025 rpc, 1026 stream).
++	if port < 1027 {
++		return nil, errors.New("proxy channel port must be 1027 or higher")
++	}
++	if socket == "" || !filepath.IsAbs(socket) {
++		return nil, errors.New("proxy channel socket must be an absolute path")
++	}
++	return &sandbox.ProxyChannel{Port: port, Socket: socket}, nil
++}
+diff --git a/internal/shim/task/proxychannel_test.go b/internal/shim/task/proxychannel_test.go
+new file mode 100644
+index 0000000..fa0a33a
+--- /dev/null
++++ b/internal/shim/task/proxychannel_test.go
+@@ -0,0 +1,48 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++       http://www.apache.org/licenses/LICENSE-2.0
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package task
++
++import (
++	"testing"
++)
++
++func TestParseProxyChannel(t *testing.T) {
++	for _, tc := range []struct {
++		name  string
++		value string
++		port  uint32
++		ok    bool
++	}{
++		{name: "valid", value: "port=1027,socket=/tmp/proxy.sock", port: 1027, ok: true},
++		{name: "high port", value: "port=1126,socket=/run/klorq/proxy.sock", port: 1126, ok: true},
++		{name: "shim rpc port reserved", value: "port=1025,socket=/tmp/proxy.sock"},
++		{name: "stream port reserved", value: "port=1026,socket=/tmp/proxy.sock"},
++		{name: "missing port", value: "socket=/tmp/proxy.sock"},
++		{name: "relative socket", value: "port=1027,socket=proxy.sock"},
++		{name: "unknown field", value: "port=1027,socket=/tmp/proxy.sock,extra=1"},
++		{name: "malformed field", value: "port=1027,socket"},
++		{name: "bad port", value: "port=abc,socket=/tmp/proxy.sock"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			channel, err := parseProxyChannel(tc.value)
++			if (err == nil) != tc.ok {
++				t.Fatalf("parseProxyChannel(%q) error = %v, want ok=%v", tc.value, err, tc.ok)
++			}
++			if tc.ok && (channel.Port != tc.port || channel.Socket == "") {
++				t.Fatalf("parsed channel = %+v", channel)
++			}
++		})
++	}
++}
+diff --git a/internal/shim/task/service.go b/internal/shim/task/service.go
+index 1946605..ab9990a 100644
+--- a/internal/shim/task/service.go
++++ b/internal/shim/task/service.go
+@@ -337,6 +337,11 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
+ 		return nil, errgrpc.ToGRPC(err)
+ 	}
+ 
++	proxyChannel, err := proxyChannelFromBundle(b)
++	if err != nil {
++		return nil, errgrpc.ToGRPC(fmt.Errorf("failed to parse proxy channel annotation: %w", err))
++	}
++
+ 	nwJSON, err := json.Marshal(ctrNetCfg)
+ 	if err != nil {
+ 		return nil, errgrpc.ToGRPC(fmt.Errorf("marshaling container networking config: %w", err))
+@@ -391,6 +396,9 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
+ 	opts = append(opts, bm.SandboxOpts()...)
+ 	opts = append(opts, blockM.SandboxOpts()...)
+ 
++	if proxyChannel != nil {
++		opts = append(opts, sandbox.WithProxyChannel(proxyChannel.Port, proxyChannel.Socket))
++	}
+ 	opts = append(opts, resCfg.SandboxOpts()...)
+ 	opts = append(opts, dumpInfoCfg.SandboxOpts()...)
+ 
+diff --git a/internal/vm/libkrun/instance.go b/internal/vm/libkrun/instance.go
+index 158b48f..a38eed8 100644
+--- a/internal/vm/libkrun/instance.go
++++ b/internal/vm/libkrun/instance.go
+@@ -174,6 +174,9 @@ type vmInstance struct {
+ 	rootfsPath string
+ 	streamPath string
+ 
++	proxyPort uint32
++	proxyPath string
++
+ 	lib     *libkrun
+ 	handler uintptr
+ 
+@@ -219,6 +222,22 @@ func (v *vmInstance) AddDisk(ctx context.Context, blockID, mountPath string, opt
+ 	return nil
+ }
+ 
++// AddProxyChannel registers a guest-dialed vsock port bridged to a host unix
++// socket in connect mode. Must be called before Start.
++func (v *vmInstance) AddProxyChannel(_ context.Context, port uint32, socketPath string) error {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	if v.client != nil {
++		return errors.New("VM already started")
++	}
++	if port < 1027 || socketPath == "" {
++		return fmt.Errorf("invalid proxy channel port=%d socket=%q", port, socketPath)
++	}
++	v.proxyPort = port
++	v.proxyPath = socketPath
++	return nil
++}
++
+ func (v *vmInstance) AddNIC(ctx context.Context, endpoint string, mac net.HardwareAddr, mode vm.NetworkMode, opts ...vm.NetworkOpt) error {
+ 	v.mu.Lock()
+ 	defer v.mu.Unlock()
+@@ -331,6 +350,22 @@ func (v *vmInstance) Start(ctx context.Context, opts ...vm.StartOpt) (err error)
+ 		return fmt.Errorf("failed to add vsock port: %w", err)
+ 	}
+ 
++	if v.proxyPort != 0 {
++		proxyPath := v.proxyPath
++		if filepath.IsAbs(proxyPath) {
++			proxyPath, err = filepath.Rel(cwd, proxyPath)
++			if err != nil {
++				return fmt.Errorf("failed to get relative proxy socket path: %w", err)
++			}
++		}
++		if (runtime.GOOS == "darwin" && len(proxyPath) >= 104) || len(proxyPath) >= 108 {
++			return fmt.Errorf("proxy socket path is too long: %s", proxyPath)
++		}
++		if err := v.vmc.AddVSockPortConnect(v.proxyPort, proxyPath); err != nil {
++			return fmt.Errorf("failed to add proxy vsock port: %w", err)
++		}
++	}
++
+ 	preVMStart := time.Now()
+ 
+ 	// Start it
