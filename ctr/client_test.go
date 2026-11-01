@@ -213,6 +213,7 @@ func TestRunBuildsCommand(t *testing.T) {
 		FIFODir:     "/tmp/fifo",
 		Mounts:      []Mount{{Source: "/work", Destination: "/work"}},
 		Env:         []string{"PARITY=1"},
+		Privileged:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -228,6 +229,9 @@ func TestRunBuildsCommand(t *testing.T) {
 		"--fifo-dir /tmp/fifo",
 		"type=bind,src=/work,dst=/work,options=rbind:rw",
 		"--env PARITY=1",
+		"--cap-add CAP_SYS_ADMIN",
+		"--cap-add CAP_NET_ADMIN",
+		"--cap-add CAP_NET_RAW",
 		"alpine:3.22 klorq-dev /bin/sh -c",
 	} {
 		if !strings.Contains(args, want) {
