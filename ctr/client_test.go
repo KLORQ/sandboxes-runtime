@@ -455,3 +455,19 @@ func TestCreateRemovesContainerWhenRunFails(t *testing.T) {
 		t.Fatalf("partial container was not removed: %s", calls)
 	}
 }
+
+func TestCreatePassesProxyChannelAnnotation(t *testing.T) {
+	runner := &fakeRunner{}
+	backend, err := NewBackend(Config{Socket: "/tmp/containerd.sock", CTR: "ctr"}, BackendOptions{Image: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.client.runner = runner
+	if _, err := backend.Create(context.Background(), runtime.Config{Name: "dev", Image: "img", ProxyPort: 1027, ProxySocket: "/run/klorq/dev.proxy.sock"}); err != nil {
+		t.Fatal(err)
+	}
+	calls := fmt.Sprint(runner.calls)
+	if !strings.Contains(calls, "io.klorq.proxy=port=1027,socket=/run/klorq/dev.proxy.sock") {
+		t.Fatalf("proxy annotation missing: %s", calls)
+	}
+}
