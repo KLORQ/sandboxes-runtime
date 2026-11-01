@@ -156,8 +156,10 @@ func waitNativeExec(ctx context.Context, status <-chan containerd.ExitStatus, ou
 		if err != nil {
 			return 0, fmt.Errorf("wait guest process: %w", err)
 		}
-		if err := waitNativeOutput(ctx, output); err != nil {
-			return 0, err
+		if err := waitNativeOutputGrace(ctx, output, nativeExecDrainGrace); err != nil {
+			if !errors.Is(err, errDrainGraceExpired) {
+				return 0, err
+			}
 		}
 		if err := errors.Join(stdout.Err(), stderr.Err()); err != nil {
 			return 0, fmt.Errorf("write guest process output: %w", err)
@@ -168,15 +170,34 @@ func waitNativeExec(ctx context.Context, status <-chan containerd.ExitStatus, ou
 	}
 }
 
-// waitNativeOutput closes FIFO reads on cancellation, then waits for containerd's
-// copy goroutines to stop. A destination writer must itself honor cancellation;
-// closing a FIFO cannot interrupt an arbitrary blocked Write call.
-func waitNativeOutput(ctx context.Context, output cio.IO) error {
+// nativeExecDrainGrace bounds how long an exited guest process's output
+// pipes may keep draining. A guest helper that outlives the main process
+// (for example BusyBox wget's ssl_client when the server closes TCP without
+// a TLS close_notify) would otherwise hold the FIFOs open indefinitely and
+// hang the exec stream even though the main process already exited.
+var nativeExecDrainGrace = 2 * time.Second
+
+var errDrainGraceExpired = errors.New("output drain grace expired")
+
+// waitNativeOutputGrace waits for containerd's FIFO copy goroutines to stop
+// after the guest process exited. Cancellation closes the FIFO reads; when
+// the grace expires the FIFOs are closed and the remaining pipe holders
+// (orphaned guest helpers) are detached so the exec stream can finish. The
+// copies themselves are not awaited on grace expiry: a fifo.Read blocked
+// while a guest helper holds the write end is not interrupted by closing the
+// FIFO on all platforms, so the copies finish later when the shim closes the
+// FIFOs at sandbox stop or delete.
+func waitNativeOutputGrace(ctx context.Context, output cio.IO, grace time.Duration) error {
 	done := make(chan struct{})
 	go func() {
 		output.Wait()
 		close(done)
 	}()
+	if grace <= 0 {
+		grace = time.Second
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
 	select {
 	case <-done:
 		return nil
@@ -184,6 +205,9 @@ func waitNativeOutput(ctx context.Context, output cio.IO) error {
 		output.Cancel()
 		<-done
 		return ctx.Err()
+	case <-timer.C:
+		output.Cancel()
+		return errDrainGraceExpired
 	}
 }
 

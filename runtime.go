@@ -16,8 +16,10 @@ type Capabilities struct {
 	IPv6      bool
 }
 
-// Rule is a CIDR/protocol/port egress rule.
+// Rule is a CIDR/protocol/port egress rule. ID is the stable policy rule
+// identifier copied into the gateway audit log; it is never used for matching.
 type Rule struct {
+	ID       string
 	Protocol string
 	CIDR     string
 	Port     uint16

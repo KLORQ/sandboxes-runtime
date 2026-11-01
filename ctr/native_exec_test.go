@@ -253,3 +253,40 @@ func TestParseExecUserAndApply(t *testing.T) {
 		t.Fatalf("uid/gid override: %#v err=%v", process.User, err)
 	}
 }
+
+type stuckNativeIO struct {
+	cio.IO
+	cancelCalled chan struct{}
+	release      chan struct{}
+}
+
+func (o *stuckNativeIO) Wait() { <-o.release }
+
+func (o *stuckNativeIO) Cancel() {
+	close(o.cancelCalled)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(o.release)
+	}()
+}
+
+func TestNativeExecDetachesOutputHoldersAfterDrainGrace(t *testing.T) {
+	oldGrace := nativeExecDrainGrace
+	nativeExecDrainGrace = 50 * time.Millisecond
+	defer func() { nativeExecDrainGrace = oldGrace }()
+	status := make(chan containerd.ExitStatus, 1)
+	status <- *containerd.NewExitStatus(3, time.Time{}, nil)
+	output := &stuckNativeIO{cancelCalled: make(chan struct{}), release: make(chan struct{})}
+	code, err := waitNativeExec(context.Background(), status, output, trackNativeOutput(nil), trackNativeOutput(nil))
+	if err != nil {
+		t.Fatalf("grace expiry must not fail exec: %v", err)
+	}
+	if code != 3 {
+		t.Fatalf("code=%d", code)
+	}
+	select {
+	case <-output.cancelCalled:
+	default:
+		t.Fatal("FIFOs not canceled after grace expiry")
+	}
+}

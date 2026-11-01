@@ -23,7 +23,7 @@ patches:
     status: experimental
   gvproxy-egress-policy:
     file: patches/gvproxy-egress-policy-v2.patch
-    sha256: f0989a7e89d9c798fe046d23ba6333d4f458ad6f333da018c02215167f3b0bdc
+    sha256: f16f22755266b2f948b05816e9c087957d8df134e134749f6b1bb0d810446fe6
     status: experimental
 images:
   default:

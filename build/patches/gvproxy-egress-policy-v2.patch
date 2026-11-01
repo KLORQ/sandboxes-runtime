@@ -1170,7 +1170,7 @@ index 00000000..ddaf7429
 +	})
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index 6a1f548a..8a71c65c 100644
+index 6a1f548a..cd1badb7 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -1,12 +1,15 @@
@@ -1189,7 +1189,7 @@ index 6a1f548a..8a71c65c 100644
  	"github.com/inetaf/tcpproxy"
  	log "github.com/sirupsen/logrus"
  	"gvisor.dev/gvisor/pkg/tcpip"
-@@ -23,52 +26,96 @@ const (
+@@ -23,52 +26,108 @@ const (
  	defaultTCPConnectTimeout = 30 * time.Second
  )
  
@@ -1231,9 +1231,13 @@ index 6a1f548a..8a71c65c 100644
 -			log.Tracef("net.DialTimeout() = %v", err)
 +		// Policy decisions and audit use the guest-visible destination,
 +		// before host NAT translation.
-+		direct, candidate := policy.TCPRoute(destAddress.String(), port)
++		direct, candidate, routeRule := policy.TCPRoute(destAddress.String(), port)
 +		if !direct && !candidate {
-+			policy.AuditTCP(destAddress.String(), port, false, "no-matching-rule")
++			reason := "no-matching-rule"
++			if routeRule != "" {
++				reason = "denied-by-rule"
++			}
++			policy.AuditTCP(destAddress.String(), port, false, reason, routeRule)
  			r.Complete(true)
  			return
  		}
@@ -1257,16 +1261,20 @@ index 6a1f548a..8a71c65c 100644
 +		if !direct {
 +			var err error
 +			name, prefix, err = readClientHello(guest, connectTimeout)
-+			if err != nil || !policy.AllowsDomain(destAddress.String(), port, name) {
-+				policy.AuditTCP(destAddress.String(), port, false, "tls-name-denied")
++			if err != nil {
++				policy.AuditTCP(destAddress.String(), port, false, "tls-hello-invalid", "")
++				return
++			}
++			if !policy.AllowsDomain(destAddress.String(), port, name) {
++				policy.AuditTCP(destAddress.String(), port, false, "tls-name-denied", policy.DomainRuleLabel(destAddress.String(), port, name))
 +				return
  			}
 +		}
 +		release()
 +		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(port)), connectTimeout)
 +		if err != nil {
- 			return
- 		}
++			return
++		}
 +		defer outbound.Close()
 +		var flowID uint64
 +		if direct {
@@ -1275,11 +1283,15 @@ index 6a1f548a..8a71c65c 100644
 +			flowID = policy.TrackDomain(destAddress.String(), port, name, outbound)
 +		}
 +		if flowID == 0 && policy.Enabled() {
-+			policy.AuditTCP(destAddress.String(), port, false, "policy-changed")
-+			return
-+		}
++			policy.AuditTCP(destAddress.String(), port, false, "policy-changed", "")
+ 			return
+ 		}
 +		if flowID != 0 {
-+			policy.AuditTCP(destAddress.String(), port, true, "flow-allowed")
++			rule := routeRule
++			if !direct {
++				rule = policy.DomainRuleLabel(destAddress.String(), port, name)
++			}
++			policy.AuditTCP(destAddress.String(), port, true, "flow-allowed", rule)
 +			defer policy.Untrack(flowID)
 +		}
 +		var input net.Conn = guest
@@ -1584,10 +1596,10 @@ index 613b32a1..37964e24 100644
  type Protocol string
 diff --git a/pkg/types/egress_policy.go b/pkg/types/egress_policy.go
 new file mode 100644
-index 00000000..6e19e7d3
+index 00000000..ec7491b8
 --- /dev/null
 +++ b/pkg/types/egress_policy.go
-@@ -0,0 +1,966 @@
+@@ -0,0 +1,1025 @@
 +package types
 +
 +import (
@@ -1607,6 +1619,8 @@ index 00000000..6e19e7d3
 +// accepted when the policy sets allowAny: true, so a missing field cannot
 +// silently turn a rule into an allow-all rule. Port 0 means any port.
 +type EgressRule struct {
++	// ID is the stable policy rule identifier copied into audit records.
++	ID       string `yaml:"id,omitempty" json:"id,omitempty"`
 +	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
 +	CIDR     string `yaml:"cidr,omitempty" json:"cidr,omitempty"`
 +	Port     uint16 `yaml:"port,omitempty" json:"port,omitempty"`
@@ -1639,7 +1653,8 @@ index 00000000..6e19e7d3
 +	Destination string `json:"destination"`
 +	Port        uint16 `json:"port"`
 +	Action      string `json:"action"`
-+	Rule        string `json:"rule"`
++	Reason      string `json:"reason,omitempty"`
++	Rule        string `json:"rule,omitempty"`
 +}
 +
 +type compiledEgressRule struct {
@@ -1649,6 +1664,16 @@ index 00000000..6e19e7d3
 +	port     uint16
 +	any      bool
 +	source   string
++	id       string
++}
++
++// label is what audit records carry: the policy rule ID when the caller
++// supplied one, otherwise the compiled expression.
++func (r compiledEgressRule) label() string {
++	if r.id != "" {
++		return r.id
++	}
++	return r.source
 +}
 +
 +func (r compiledEgressRule) matches(protocol string, ip net.IP, port uint16) bool {
@@ -1705,12 +1730,12 @@ index 00000000..6e19e7d3
 +	}
 +	for _, rule := range s.deny {
 +		if rule.matches(protocol, ip, port) {
-+			return false, "deny:" + rule.source
++			return false, "deny:" + rule.label()
 +		}
 +	}
 +	for _, rule := range s.allow {
 +		if rule.matches(protocol, ip, port) {
-+			return true, "allow:" + rule.source
++			return true, "allow:" + rule.label()
 +		}
 +	}
 +	return false, "default-deny"
@@ -1753,6 +1778,7 @@ index 00000000..6e19e7d3
 +			source = fmt.Sprintf("%s any port=%d", protocol, rule.Port)
 +		}
 +		compiled = append(compiled, compiledEgressRule{
++			id:       strings.TrimSpace(rule.ID),
 +			protocol: protocol,
 +			network:  network,
 +			domain:   domain,
@@ -1772,6 +1798,11 @@ index 00000000..6e19e7d3
 +	pattern = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(pattern), "."))
 +	if pattern == "" || len(pattern) > 253 || strings.ContainsAny(pattern, "\\ ") {
 +		return nil, fmt.Errorf("invalid domain %q", pattern)
++	}
++	// Domain rules match TLS hostnames; an IP literal can never match and
++	// would silently turn a deny into a no-op.
++	if net.ParseIP(pattern) != nil {
++		return nil, fmt.Errorf("domain %q is an IP literal; use cidr", pattern)
 +	}
 +	var expression string
 +	switch {
@@ -2119,8 +2150,9 @@ index 00000000..6e19e7d3
 +	return id
 +}
 +
-+// AuditTCP records a decision without storing a TLS name or payload.
-+func (h *EgressPolicyHolder) AuditTCP(address string, port uint16, allowed bool, reason string) {
++// AuditTCP records a decision code and the matched rule identifier without
++// storing a TLS name or payload.
++func (h *EgressPolicyHolder) AuditTCP(address string, port uint16, allowed bool, reason, rule string) {
 +	if h == nil {
 +		return
 +	}
@@ -2134,28 +2166,30 @@ index 00000000..6e19e7d3
 +	if allowed {
 +		action = "allow"
 +	}
-+	_ = audit.record(EgressDecision{SandboxID: snapshot.sandboxID, Revision: snapshot.revision, Protocol: "tcp", Destination: address, Port: port, Action: action, Rule: reason})
++	_ = audit.record(EgressDecision{SandboxID: snapshot.sandboxID, Revision: snapshot.revision, Protocol: "tcp", Destination: address, Port: port, Action: action, Reason: reason, Rule: rule})
 +}
 +
 +// TCPRoute distinguishes direct CIDR authorization from a domain candidate.
-+func (h *EgressPolicyHolder) TCPRoute(address string, port uint16) (direct, candidate bool) {
++// The returned rule is the matched allow/deny rule ID (or expression) so the
++// audit record can name the decision, not just the outcome.
++func (h *EgressPolicyHolder) TCPRoute(address string, port uint16) (direct, candidate bool, rule string) {
 +	if h == nil {
-+		return true, false
++		return true, false, ""
 +	}
 +	h.mu.RLock()
 +	defer h.mu.RUnlock()
 +	if h.snapshot == nil {
-+		return true, false
++		return true, false, ""
 +	}
 +	allowed, reason := h.snapshot.decide("tcp", address, port)
 +	if allowed {
-+		return true, false
++		return true, false, strings.TrimPrefix(reason, "allow:")
 +	}
 +	if reason != "default-deny" {
-+		return false, false
++		return false, false, strings.TrimPrefix(reason, "deny:")
 +	}
 +	_, candidate = h.resolvedNameLocked("tcp", address, port)
-+	return false, candidate
++	return false, candidate, ""
 +}
 +
 +func (h *EgressPolicyHolder) nameAllowedLocked(protocol, address string, port uint16, name string) bool {
@@ -2216,6 +2250,43 @@ index 00000000..6e19e7d3
 +	id := h.nextFlowID
 +	h.flows[id] = trackedEgressFlow{protocol: "tcp", address: address, port: port, closer: closer}
 +	return id
++}
++
++// AllowRuleLabel reports the allow rule ID that authorizes an IP flow, or "".
++func (h *EgressPolicyHolder) AllowRuleLabel(address string, port uint16) string {
++	if h == nil {
++		return ""
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	if h.snapshot == nil {
++		return ""
++	}
++	allowed, reason := h.snapshot.decide("tcp", address, port)
++	if !allowed {
++		return ""
++	}
++	return strings.TrimPrefix(reason, "allow:")
++}
++
++// DomainRuleLabel reports the allow rule ID that authorizes name for the
++// currently bound address, or "" when no rule matches.
++func (h *EgressPolicyHolder) DomainRuleLabel(address string, port uint16, name string) string {
++	if h == nil {
++		return ""
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	if h.snapshot == nil || !h.nameAllowedLocked("tcp", address, port, name) {
++		return ""
++	}
++	normalized := strings.TrimSuffix(strings.ToLower(name), ".")
++	for _, rule := range h.snapshot.allow {
++		if rule.matchesDomain("tcp", normalized, port) {
++			return rule.label()
++		}
++	}
++	return ""
 +}
 +
 +// AllowsDomain checks a TLS name against the current DNS binding and policy.
@@ -2556,10 +2627,10 @@ index 00000000..6e19e7d3
 +}
 diff --git a/pkg/types/egress_policy_test.go b/pkg/types/egress_policy_test.go
 new file mode 100644
-index 00000000..96f996d7
+index 00000000..b21c5612
 --- /dev/null
 +++ b/pkg/types/egress_policy_test.go
-@@ -0,0 +1,534 @@
+@@ -0,0 +1,613 @@
 +package types
 +
 +import (
@@ -2632,6 +2703,13 @@ index 00000000..96f996d7
 +	defer holder.Close()
 +	if holder.Allows("tcp", "127.0.0.1", 443) || holder.Allows("udp", "127.0.0.1", 53) {
 +		t.Fatal("a present policy with no allow rules must deny by default")
++	}
++}
++
++func TestIPLiteralDomainRuleIsRejected(t *testing.T) {
++	policy := &EgressPolicy{Deny: []EgressRule{{Protocol: "tcp", Domain: "192.0.2.10", Port: 443}}}
++	if err := policy.Validate(); err == nil {
++		t.Fatal("an IP literal domain rule must fail closed instead of matching nothing")
 +	}
 +}
 +
@@ -2718,6 +2796,78 @@ index 00000000..96f996d7
 +		t.Fatal("audit log is empty")
 +	}
 +	for _, want := range []string{`"revision":"r3"`, `"sandboxId":"sbx-test"`, `"action":"allow"`, `"action":"deny"`, `"rule":"default-deny"`} {
++		if !strings.Contains(string(content), want) {
++			t.Fatalf("audit log does not contain %s: %s", want, content)
++		}
++	}
++}
++
++func TestAuditRecordsPolicyRuleIDs(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "egress.jsonl")
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision:  "r4",
++		SandboxID: "sbx-test",
++		AuditLog:  path,
++		Allow: []EgressRule{{
++			ID:       "rul_allow_cidr",
++			Protocol: "tcp",
++			CIDR:     "192.0.2.4/32",
++			Port:     443,
++		}, {
++			ID:       "rul_allow_domain",
++			Protocol: "tcp",
++			Domain:   "api.example.test",
++			Port:     443,
++		}},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	if got := holder.AllowRuleLabel("192.0.2.4", 443); got != "rul_allow_cidr" {
++		t.Fatalf("AllowRuleLabel = %q, want rul_allow_cidr", got)
++	}
++	if got := holder.AllowRuleLabel("192.0.2.5", 443); got != "" {
++		t.Fatalf("AllowRuleLabel for unauthorized IP = %q, want empty", got)
++	}
++	holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.4")}})
++	if got := holder.DomainRuleLabel("192.0.2.4", 443, "api.example.test"); got != "rul_allow_domain" {
++		t.Fatalf("DomainRuleLabel = %q, want rul_allow_domain", got)
++	}
++	if got := holder.DomainRuleLabel("192.0.2.9", 443, "api.example.test"); got != "" {
++		t.Fatalf("DomainRuleLabel for unbound address = %q, want empty", got)
++	}
++	holder.AuditTCP("192.0.2.4", 443, true, "flow-allowed", holder.AllowRuleLabel("192.0.2.4", 443))
++	holder.AuditTCP("192.0.2.9", 443, false, "tls-name-denied", holder.DomainRuleLabel("192.0.2.9", 443, "api.example.test"))
++	if err := holder.Update(&EgressPolicy{
++		Revision:  "r5",
++		SandboxID: "sbx-test",
++		AuditLog:  path,
++		Deny:      []EgressRule{{ID: "rul_deny_host", Protocol: "tcp", CIDR: "192.0.2.4/32", Port: 443}},
++	}); err != nil {
++		t.Fatal(err)
++	}
++	direct, candidate, denyRule := holder.TCPRoute("192.0.2.4", 443)
++	if direct || candidate || denyRule != "rul_deny_host" {
++		t.Fatalf("TCPRoute denied flow = direct:%v candidate:%v rule:%q", direct, candidate, denyRule)
++	}
++	if got := holder.AllowRuleLabel("192.0.2.4", 443); got != "" {
++		t.Fatalf("deny must win over allow, got label %q", got)
++	}
++	holder.AuditTCP("192.0.2.4", 443, false, "denied-by-rule", denyRule)
++	content, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, want := range []string{
++		`"action":"allow"`,
++		`"reason":"flow-allowed"`,
++		`"rule":"rul_allow_cidr"`,
++		`"reason":"tls-name-denied"`,
++		`"action":"deny"`,
++		`"reason":"denied-by-rule"`,
++		`"rule":"rul_deny_host"`,
++	} {
 +		if !strings.Contains(string(content), want) {
 +			t.Fatalf("audit log does not contain %s: %s", want, content)
 +		}
@@ -2894,7 +3044,7 @@ index 00000000..96f996d7
 +	}
 +	defer holder.Close()
 +	holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}})
-+	if direct, candidate := holder.TCPRoute("203.0.113.10", 443); direct || !candidate {
++	if direct, candidate, _ := holder.TCPRoute("203.0.113.10", 443); direct || !candidate {
 +		t.Fatal("expected domain candidate")
 +	}
 +	if !holder.AllowsDomain("203.0.113.10", 443, "api.example.test") {
