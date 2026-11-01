@@ -1,5 +1,5 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 16cbad47..0a99b9e7 100644
+index 16cbad4..0a99b9e 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
 @@ -24,31 +24,33 @@ const (
@@ -147,7 +147,7 @@ index 16cbad47..0a99b9e7 100644
  	// Make sure the qemu socket provided is valid syntax
  	if config.Interfaces.Qemu != "" {
 diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
-index 21ab61ee..3b1362c4 100644
+index 21ab61e..3b1362c 100644
 --- a/cmd/gvproxy/main.go
 +++ b/cmd/gvproxy/main.go
 @@ -5,6 +5,7 @@ import (
@@ -231,25 +231,26 @@ index 21ab61ee..3b1362c4 100644
  	apiToken, err := tokenauth.ReadToken(config.APITokenFile)
  	if err != nil {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index aeeb9766..e84ce225 100644
+index aeeb976..a447a92 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
-@@ -28,9 +28,11 @@ type upstreamResolver interface {
+@@ -28,9 +28,12 @@ type upstreamResolver interface {
  var validDNSChars = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
  
  type dnsHandler struct {
 -	zones     []types.Zone
 -	zonesLock sync.RWMutex
 -	upstream  upstreamResolver
-+	zones         []types.Zone
-+	zonesLock     sync.RWMutex
-+	upstream      upstreamResolver
-+	allowUpstream bool
-+	policy        *types.EgressPolicyHolder
++	zones          []types.Zone
++	zonesLock      sync.RWMutex
++	upstream       upstreamResolver
++	allowUpstream  bool
++	policy         *types.EgressPolicyHolder
++	policyUpstream string
  	// nameservers are the host's upstream DNS servers ("ip:port") used to
  	// forward raw queries for record types that Go's net.Resolver cannot
  	// look up directly (SOA, PTR, AAAA, CAA, ...).
-@@ -134,6 +136,14 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+@@ -134,15 +137,33 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
  		if done := h.addLocalAnswers(m, q); done {
  			return
  		}
@@ -262,9 +263,18 @@ index aeeb9766..e84ce225 100644
 +			return
 +		}
  
++		if h.policy != nil && h.policy.Enabled() && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA) {
++			h.addPolicyIPAnswers(m, q)
++			return
++		}
  		resolver := h.upstream
  		switch q.Qtype {
-@@ -143,6 +153,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+ 		case dns.TypeA:
+ 			ips, err := resolver.LookupIPAddr(context.TODO(), q.Name)
+ 			if err != nil {
++				if h.policy != nil {
++					h.policy.RecordDNS(q.Name, nil)
++				}
  				m.Rcode = dns.RcodeNameError
  				return
  			}
@@ -274,7 +284,7 @@ index aeeb9766..e84ce225 100644
  			for _, ip := range ips {
  				if len(ip.IP.To4()) != net.IPv4len {
  					continue
-@@ -309,23 +322,38 @@ type Server struct {
+@@ -309,23 +330,38 @@ type Server struct {
  	handler *dnsHandler
  }
  
@@ -321,7 +331,7 @@ index aeeb9766..e84ce225 100644
  	mux := dns.NewServeMux()
  	mux.HandleFunc(".", s.handler.handleUDP)
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
-index 53b4f1e3..0dacf732 100644
+index 53b4f1e..0dacf73 100644
 --- a/pkg/services/dns/dns_test.go
 +++ b/pkg/services/dns/dns_test.go
 @@ -199,7 +199,10 @@ var _ = ginkgo.Describe("dns add test", func() {
@@ -427,7 +437,7 @@ index 53b4f1e3..0dacf732 100644
  	}, nil
 diff --git a/pkg/services/dns/egress_policy_test.go b/pkg/services/dns/egress_policy_test.go
 new file mode 100644
-index 00000000..f720f19b
+index 0000000..f720f19
 --- /dev/null
 +++ b/pkg/services/dns/egress_policy_test.go
 @@ -0,0 +1,38 @@
@@ -469,11 +479,709 @@ index 00000000..f720f19b
 +		t.Fatalf("got rcode=%d answers=%v, want local A answer", m.Rcode, m.Answer)
 +	}
 +}
+diff --git a/pkg/services/dns/policy_dns.go b/pkg/services/dns/policy_dns.go
+new file mode 100644
+index 0000000..b651e7c
+--- /dev/null
++++ b/pkg/services/dns/policy_dns.go
+@@ -0,0 +1,191 @@
++package dns
++
++import (
++	"fmt"
++	"net"
++	"strings"
++	"time"
++
++	"github.com/miekg/dns"
++)
++
++const maxPolicyCNAMEs = 16
++const maxPolicyDNSRecords = 256
++
++// addPolicyIPAnswers uses only the configured resolver: net.Resolver discards
++// TTL and can silently consult a different host resolver for other queries.
++func (h *dnsHandler) addPolicyIPAnswers(m *dns.Msg, q dns.Question) {
++	family := 4
++	if q.Qtype == dns.TypeAAAA {
++		family = 6
++	}
++	generation := h.policy.BeginDNS(q.Name, family)
++	if generation == 0 {
++		m.Rcode = dns.RcodeServerFailure
++		return
++	}
++	clear := func() bool { return h.policy.CommitDNS(q.Name, nil, 0, family, generation) }
++	fail := func(code int) { clear(); m.Answer = nil; m.Rcode = code }
++	if h.policyUpstream == "" || q.Qclass != dns.ClassINET {
++		fail(dns.RcodeServerFailure)
++		return
++	}
++	current := dns.Fqdn(strings.ToLower(q.Name))
++	seen := make(map[string]bool)
++	validUntil := time.Now().Add(10 * time.Minute)
++	var answers []dns.RR
++	var addresses []net.IPAddr
++	for depth := 0; depth <= maxPolicyCNAMEs; depth++ {
++		if seen[current] || h.policy.DNSDenied(current) {
++			fail(dns.RcodeRefused)
++			return
++		}
++		seen[current] = true
++		req := new(dns.Msg)
++		req.SetQuestion(current, q.Qtype)
++		resp, err := h.exchangePolicyDNS(req)
++		responseTime := time.Now()
++		includeTTL := func(ttl uint32) {
++			if until := responseTime.Add(time.Duration(ttl) * time.Second); until.Before(validUntil) {
++				validUntil = until
++			}
++		}
++		if err != nil || resp == nil || !resp.Response || resp.Truncated || len(resp.Question) != 1 || !strings.EqualFold(resp.Question[0].Name, current) || resp.Question[0].Qtype != q.Qtype || resp.Question[0].Qclass != dns.ClassINET || len(resp.Answer) > maxPolicyDNSRecords {
++			fail(dns.RcodeServerFailure)
++			return
++		}
++		if resp.Rcode != dns.RcodeSuccess {
++			fail(resp.Rcode)
++			return
++		}
++		// Follow only records reachable from the requested owner. An answer can
++		// contain a whole chain, or just a CNAME requiring another query.
++		follow := current
++		for {
++			alias, found, parseErr := policyRRs(resp.Answer, follow, family)
++			if parseErr != nil {
++				fail(dns.RcodeServerFailure)
++				return
++			}
++			if len(found) != 0 {
++				for _, rr := range found {
++					includeTTL(rr.Header().Ttl)
++					switch v := rr.(type) {
++					case *dns.A:
++						addresses = append(addresses, net.IPAddr{IP: v.A})
++					case *dns.AAAA:
++						addresses = append(addresses, net.IPAddr{IP: v.AAAA})
++					}
++					answers = append(answers, rr)
++				}
++				aliases := make([]string, 0, len(seen))
++				for alias := range seen {
++					if !strings.EqualFold(alias, q.Name) {
++						aliases = append(aliases, alias)
++					}
++				}
++				if !h.policy.CommitDNS(q.Name, addresses, time.Until(validUntil), family, generation, aliases...) {
++					fail(dns.RcodeServerFailure)
++					return
++				}
++				m.Answer = append(m.Answer, answers...)
++				return
++			}
++			if alias == nil {
++				if follow == current {
++					if !clear() {
++						fail(dns.RcodeServerFailure)
++						return
++					}
++					m.Answer = append(m.Answer, answers...)
++					return
++				}
++				current = follow
++				break
++			}
++			target := dns.Fqdn(strings.ToLower(alias.Target))
++			if _, ok := dns.IsDomainName(target); !ok || seen[target] || h.policy.DNSDenied(target) || len(seen) >= maxPolicyCNAMEs {
++				fail(dns.RcodeRefused)
++				return
++			}
++			includeTTL(alias.Hdr.Ttl)
++			answers = append(answers, alias)
++			seen[target] = true
++			follow = target
++		}
++		// The target has not actually been queried yet; let the outer loop own it.
++		delete(seen, current)
++	}
++	fail(dns.RcodeServerFailure)
++}
++
++// exchangePolicyDNS retries truncated UDP responses over TCP to the same
++// configured upstream. It never falls back to a host nameserver.
++func (h *dnsHandler) exchangePolicyDNS(req *dns.Msg) (*dns.Msg, error) {
++	if h.client == nil || h.policyUpstream == "" {
++		return nil, fmt.Errorf("policy DNS upstream unavailable")
++	}
++	resp, _, err := h.client.Exchange(req, h.policyUpstream)
++	if err != nil || resp == nil {
++		return nil, fmt.Errorf("policy DNS exchange failed: %v", err)
++	}
++	if !resp.Truncated {
++		return resp, nil
++	}
++	if !resp.Response || len(resp.Question) != 1 || len(req.Question) != 1 || !strings.EqualFold(resp.Question[0].Name, req.Question[0].Name) || resp.Question[0].Qtype != req.Question[0].Qtype || resp.Question[0].Qclass != req.Question[0].Qclass {
++		return nil, fmt.Errorf("invalid truncated DNS response")
++	}
++	tcp := *h.client
++	tcp.Net = "tcp"
++	resp, _, err = tcp.Exchange(req, h.policyUpstream)
++	if err != nil || resp == nil || resp.Truncated {
++		return nil, fmt.Errorf("policy DNS TCP retry failed: %v", err)
++	}
++	return resp, nil
++}
++
++// policyRRs extracts only records belonging to one reachable CNAME owner.
++func policyRRs(records []dns.RR, owner string, family int) (*dns.CNAME, []dns.RR, error) {
++	if len(records) > maxPolicyDNSRecords || (family != 4 && family != 6) {
++		return nil, nil, fmt.Errorf("invalid DNS record set")
++	}
++	var alias *dns.CNAME
++	var found []dns.RR
++	for _, rr := range records {
++		if rr == nil || !strings.EqualFold(rr.Header().Name, owner) || rr.Header().Class != dns.ClassINET {
++			continue
++		}
++		switch v := rr.(type) {
++		case *dns.CNAME:
++			if alias != nil {
++				return nil, nil, fmt.Errorf("multiple CNAME records")
++			}
++			alias = v
++		case *dns.A:
++			if family == 4 && v.A.To4() != nil {
++				found = append(found, rr)
++			}
++		case *dns.AAAA:
++			if family == 6 && v.AAAA.To16() != nil && v.AAAA.To4() == nil {
++				found = append(found, rr)
++			}
++		}
++	}
++	if alias != nil && len(found) != 0 {
++		return nil, nil, fmt.Errorf("CNAME and addresses share an owner")
++	}
++	return alias, found, nil
++}
++
++func (s *Server) SetPolicyUpstream(address string) error {
++	if address == "" {
++		return nil
++	}
++	if _, _, err := net.SplitHostPort(address); err != nil {
++		return fmt.Errorf("invalid policy DNS upstream: %w", err)
++	}
++	s.handler.policyUpstream = address
++	// All raw fallbacks use the configured resolver, never host resolv.conf.
++	s.handler.nameservers = []string{address}
++	return nil
++}
+diff --git a/pkg/services/dns/policy_dns_test.go b/pkg/services/dns/policy_dns_test.go
+new file mode 100644
+index 0000000..7a0fbde
+--- /dev/null
++++ b/pkg/services/dns/policy_dns_test.go
+@@ -0,0 +1,295 @@
++package dns
++
++import (
++	"net"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"github.com/miekg/dns"
++)
++
++func TestPolicyDNSUsesTTLChainAndConfiguredUpstream(t *testing.T) {
++	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	mux := dns.NewServeMux()
++	mux.HandleFunc(".", func(w dns.ResponseWriter, q *dns.Msg) {
++		response := new(dns.Msg)
++		response.SetReply(q)
++		name := q.Question[0].Name
++		rr := func(text string) dns.RR {
++			out, e := dns.NewRR(text)
++			if e != nil {
++				panic(e)
++			}
++			return out
++		}
++		switch name {
++		case "api.example.test.":
++			if q.Question[0].Qtype == dns.TypeA {
++				response.Answer = []dns.RR{rr("api.example.test. 1 IN CNAME cdn.example.test."), rr("cdn.example.test. 30 IN A 192.0.2.4"), rr("irrelevant.example.test. 30 IN A 192.0.2.99")}
++			}
++			if q.Question[0].Qtype == dns.TypeAAAA {
++				response.Answer = []dns.RR{rr("api.example.test. 30 IN AAAA 2001:db8::4")}
++			}
++		case "zero.example.test.":
++			response.Answer = []dns.RR{rr("zero.example.test. 0 IN A 192.0.2.5")}
++		case "blocked.example.test.":
++			response.Answer = []dns.RR{rr("blocked.example.test. 30 IN CNAME secret.example.test."), rr("secret.example.test. 30 IN A 192.0.2.6")}
++		case "loop.example.test.":
++			response.Answer = []dns.RR{rr("loop.example.test. 30 IN CNAME next.example.test."), rr("next.example.test. 30 IN CNAME loop.example.test.")}
++		case "split.example.test.":
++			response.Answer = []dns.RR{rr("split.example.test. 30 IN CNAME target.example.test.")}
++		case "target.example.test.":
++			response.Answer = []dns.RR{rr("target.example.test. 30 IN A 192.0.2.7")}
++		case "slow.example.test.":
++			response.Answer = []dns.RR{rr("slow.example.test. 1 IN CNAME slow-target.example.test.")}
++		case "slow-target.example.test.":
++			time.Sleep(1200 * time.Millisecond)
++			response.Answer = []dns.RR{rr("slow-target.example.test. 30 IN A 192.0.2.8")}
++		default:
++			response.Rcode = dns.RcodeNameError
++		}
++		_ = w.WriteMsg(response)
++	})
++	srv := &dns.Server{PacketConn: packet, Handler: mux}
++	go func() { _ = srv.ActivateAndServe() }()
++	t.Cleanup(func() {
++		if e := srv.Shutdown(); e != nil {
++			t.Errorf("shutdown: %v", e)
++		}
++	})
++	holder, err := types.NewEgressPolicyHolder(&types.EgressPolicy{Allow: []types.EgressRule{{Protocol: "tcp", Domain: "*.example.test", Port: 443}}, Deny: []types.EgressRule{{Protocol: "tcp", Domain: "secret.example.test", Port: 443}}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = holder.Close() })
++	h := &dnsHandler{policy: holder, allowUpstream: true, policyUpstream: packet.LocalAddr().String(), client: &dns.Client{Timeout: 2 * time.Second}}
++	ask := func(name string, typ uint16) *dns.Msg {
++		m := new(dns.Msg)
++		m.SetQuestion(name, typ)
++		h.addAnswers(m)
++		return m
++	}
++	m := ask("api.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 2 || !holder.AllowsDomain("192.0.2.4", 443, "api.example.test") {
++		t.Fatalf("A result: rcode=%d answers=%v", m.Rcode, m.Answer)
++	}
++	if holder.AllowsDomain("192.0.2.99", 443, "api.example.test") {
++		t.Fatal("unrelated answer created a binding")
++	}
++	m = ask("api.example.test.", dns.TypeAAAA)
++	if m.Rcode != dns.RcodeSuccess || !holder.AllowsDomain("2001:db8::4", 443, "api.example.test") || !holder.AllowsDomain("192.0.2.4", 443, "api.example.test") {
++		t.Fatalf("AAAA result: rcode=%d answers=%v", m.Rcode, m.Answer)
++	}
++	time.Sleep(1200 * time.Millisecond)
++	if holder.AllowsDomain("192.0.2.4", 443, "api.example.test") {
++		t.Fatal("CNAME TTL ignored")
++	}
++	if !holder.AllowsDomain("2001:db8::4", 443, "api.example.test") {
++		t.Fatal("AAAA binding expired prematurely")
++	}
++	m = ask("zero.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeSuccess || holder.AllowsDomain("192.0.2.5", 443, "zero.example.test") {
++		t.Fatal("zero TTL produced a binding")
++	}
++	m = ask("blocked.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeRefused || holder.AllowsDomain("192.0.2.6", 443, "blocked.example.test") {
++		t.Fatal("denied CNAME target accepted")
++	}
++	m = ask("loop.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeRefused {
++		t.Fatalf("CNAME loop rcode=%d", m.Rcode)
++	}
++	m = ask("split.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 2 || !holder.AllowsDomain("192.0.2.7", 443, "split.example.test") {
++		t.Fatalf("split CNAME rcode=%d answers=%v", m.Rcode, m.Answer)
++	}
++	m = ask("slow.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeSuccess || holder.AllowsDomain("192.0.2.8", 443, "slow.example.test") {
++		t.Fatal("expired alias TTL was extended by subsequent lookup")
++	}
++	h.policyUpstream = ""
++	h.nameservers = []string{packet.LocalAddr().String()}
++	m = ask("api.example.test.", dns.TypeA)
++	if m.Rcode != dns.RcodeServerFailure || holder.AllowsDomain("192.0.2.4", 443, "api.example.test") {
++		t.Fatal("missing configured upstream did not fail closed")
++	}
++}
++
++func TestPolicyUpstreamReplacesFallback(t *testing.T) {
++	s := &Server{handler: &dnsHandler{nameservers: []string{"192.0.2.1:53"}}}
++	if err := s.SetPolicyUpstream("127.0.0.1:5300"); err != nil {
++		t.Fatal(err)
++	}
++	if len(s.handler.nameservers) != 1 || s.handler.nameservers[0] != "127.0.0.1:5300" {
++		t.Fatal("system DNS remained configured")
++	}
++	if err := s.SetPolicyUpstream("invalid"); err == nil {
++		t.Fatal("invalid upstream accepted")
++	}
++}
++
++func TestPolicyDNSOutOfOrderResponsesFailClosed(t *testing.T) {
++	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	started := make(chan struct{})
++	release := make(chan struct{})
++	var count atomic.Int32
++	mux := dns.NewServeMux()
++	mux.HandleFunc(".", func(w dns.ResponseWriter, q *dns.Msg) {
++		n := count.Add(1)
++		if n == 1 {
++			close(started)
++			<-release
++		}
++		m := new(dns.Msg)
++		m.SetReply(q)
++		ip := net.ParseIP("192.0.2.2")
++		if n == 1 {
++			ip = net.ParseIP("192.0.2.1")
++		}
++		m.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30}, A: ip}}
++		_ = w.WriteMsg(m)
++	})
++	srv := &dns.Server{PacketConn: packet, Handler: mux}
++	go func() { _ = srv.ActivateAndServe() }()
++	t.Cleanup(func() {
++		if err := srv.Shutdown(); err != nil {
++			t.Errorf("shutdown: %v", err)
++		}
++	})
++	holder, err := types.NewEgressPolicyHolder(&types.EgressPolicy{Allow: []types.EgressRule{{Protocol: "tcp", Domain: "api.example.test", Port: 443}}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	h := &dnsHandler{policy: holder, allowUpstream: true, policyUpstream: packet.LocalAddr().String(), client: &dns.Client{Timeout: 2 * time.Second}}
++	ask := func() *dns.Msg {
++		m := new(dns.Msg)
++		m.SetQuestion("api.example.test.", dns.TypeA)
++		h.addAnswers(m)
++		return m
++	}
++	old := make(chan *dns.Msg, 1)
++	go func() { old <- ask() }()
++	select {
++	case <-started:
++	case <-time.After(time.Second):
++		t.Fatal("first DNS query did not arrive")
++	}
++	fresh := ask()
++	close(release)
++	stale := <-old
++	if fresh.Rcode != dns.RcodeSuccess || stale.Rcode != dns.RcodeServerFailure {
++		t.Fatalf("fresh=%d stale=%d", fresh.Rcode, stale.Rcode)
++	}
++	if holder.AllowsDomain("192.0.2.1", 443, "api.example.test") || !holder.AllowsDomain("192.0.2.2", 443, "api.example.test") {
++		t.Fatal("stale DNS answer authorized")
++	}
++}
++
++func FuzzPolicyDNSAnswers(f *testing.F) {
++	seed := new(dns.Msg)
++	seed.SetQuestion("api.example.test.", dns.TypeA)
++	seed.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "api.example.test.", Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 10}, A: net.ParseIP("192.0.2.1")}}
++	raw, err := seed.Pack()
++	if err != nil {
++		f.Fatal(err)
++	}
++	f.Add(raw)
++	f.Add([]byte{0, 1, 2, 3})
++	f.Fuzz(func(t *testing.T, data []byte) {
++		if len(data) > dns.MaxMsgSize {
++			t.Skip()
++		}
++		var msg dns.Msg
++		if err := msg.Unpack(data); err != nil {
++			return
++		}
++		for _, family := range []int{4, 6} {
++			alias, records, err := policyRRs(msg.Answer, "api.example.test.", family)
++			if err == nil && alias != nil && len(records) > 0 {
++				t.Fatal("CNAME and addresses accepted together")
++			}
++		}
++	})
++}
++
++func TestPolicyDNSTruncationRetriesOnlyConfiguredUpstream(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	packet, err := net.ListenPacket("udp", listener.Addr().String())
++	if err != nil {
++		listener.Close()
++		t.Fatal(err)
++	}
++	var udpQueries, tcpQueries atomic.Int32
++	mux := dns.NewServeMux()
++	mux.HandleFunc(".", func(w dns.ResponseWriter, q *dns.Msg) {
++		m := new(dns.Msg)
++		m.SetReply(q)
++		if strings.HasPrefix(w.RemoteAddr().Network(), "udp") {
++			udpQueries.Add(1)
++			if q.Question[0].Name == "tampered.example.test." {
++				m.Question[0].Name = "wrong.example.test."
++			}
++			m.Truncated = true
++		} else {
++			tcpQueries.Add(1)
++			if q.Question[0].Name == "truncated.example.test." {
++				m.Truncated = true
++			} else {
++				m.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: q.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 30}, A: net.ParseIP("192.0.2.20")}}
++			}
++		}
++		_ = w.WriteMsg(m)
++	})
++	udpServer := &dns.Server{PacketConn: packet, Handler: mux}
++	tcpServer := &dns.Server{Listener: listener, Handler: mux}
++	go func() { _ = udpServer.ActivateAndServe() }()
++	go func() { _ = tcpServer.ActivateAndServe() }()
++	t.Cleanup(func() {
++		if err := udpServer.Shutdown(); err != nil {
++			t.Errorf("udp cleanup: %v", err)
++		}
++		if err := tcpServer.Shutdown(); err != nil {
++			t.Errorf("tcp cleanup: %v", err)
++		}
++	})
++	holder, err := types.NewEgressPolicyHolder(&types.EgressPolicy{Allow: []types.EgressRule{{Protocol: "tcp", Domain: "*.example.test", Port: 443}}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	h := &dnsHandler{policy: holder, allowUpstream: true, policyUpstream: listener.Addr().String(), nameservers: []string{"192.0.2.1:53"}, client: &dns.Client{Timeout: time.Second}}
++	ask := func(name string) *dns.Msg {
++		m := new(dns.Msg)
++		m.SetQuestion(name, dns.TypeA)
++		h.addAnswers(m)
++		return m
++	}
++	good := ask("api.example.test.")
++	if good.Rcode != dns.RcodeSuccess || !holder.AllowsDomain("192.0.2.20", 443, "api.example.test") {
++		t.Fatalf("TCP retry did not authorize: rcode=%d", good.Rcode)
++	}
++	bad := ask("truncated.example.test.")
++	if bad.Rcode != dns.RcodeServerFailure || holder.AllowsDomain("192.0.2.20", 443, "truncated.example.test") {
++		t.Fatal("truncated TCP answer accepted")
++	}
++	tampered := ask("tampered.example.test.")
++	if tampered.Rcode != dns.RcodeServerFailure {
++		t.Fatal("mismatched truncated question accepted")
++	}
++	if udpQueries.Load() != 3 || tcpQueries.Load() != 2 {
++		t.Fatalf("UDP=%d TCP=%d", udpQueries.Load(), tcpQueries.Load())
++	}
++}
+diff --git a/pkg/services/forwarder/clienthello.go b/pkg/services/forwarder/clienthello.go
+new file mode 100644
+index 0000000..3c6a490
+--- /dev/null
++++ b/pkg/services/forwarder/clienthello.go
+@@ -0,0 +1,75 @@
++package forwarder
++
++import (
++	"bytes"
++	"crypto/tls"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"time"
++)
++
++const maxClientHelloBytes = 64 << 10
++
++var errClientHelloCaptured = errors.New("client hello captured")
++
++type helloCaptureConn struct {
++	net.Conn
++	captured bytes.Buffer
++}
++
++func (c *helloCaptureConn) Read(p []byte) (int, error) {
++	remaining := maxClientHelloBytes - c.captured.Len()
++	if remaining <= 0 {
++		return 0, errors.New("client hello exceeds limit")
++	}
++	if len(p) > remaining {
++		p = p[:remaining]
++	}
++	n, err := c.Conn.Read(p)
++	_, _ = c.captured.Write(p[:n])
++	return n, err
++}
++
++func (c *helloCaptureConn) Write([]byte) (int, error) {
++	return 0, errors.New("unexpected TLS server response")
++}
++
++// readClientHello consumes a bounded TLS handshake prefix, without completing
++// TLS or writing to the client. The caller must replay the prefix unmodified.
++func readClientHello(conn net.Conn, timeout time.Duration) (string, []byte, error) {
++	if timeout <= 0 || timeout > 30*time.Second {
++		timeout = 30 * time.Second
++	}
++	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
++		return "", nil, fmt.Errorf("set hello deadline: %w", err)
++	}
++	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
++	capture := &helloCaptureConn{Conn: conn}
++	var name string
++	server := tls.Server(capture, &tls.Config{GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
++		for _, ext := range hello.Extensions {
++			if ext == 0xfe0d {
++				return nil, errors.New("encrypted client hello unsupported")
++			}
++		}
++		name = hello.ServerName
++		return nil, errClientHelloCaptured
++	}})
++	err := server.Handshake()
++	if !errors.Is(err, errClientHelloCaptured) {
++		return "", nil, fmt.Errorf("invalid TLS client hello: %w", err)
++	}
++	if name == "" {
++		return "", nil, errors.New("TLS client hello missing server name")
++	}
++	return name, bytes.Clone(capture.captured.Bytes()), nil
++}
++
++type replayConn struct {
++	net.Conn
++	reader io.Reader
++}
++
++func (c *replayConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+diff --git a/pkg/services/forwarder/clienthello_test.go b/pkg/services/forwarder/clienthello_test.go
+new file mode 100644
+index 0000000..ddaf742
+--- /dev/null
++++ b/pkg/services/forwarder/clienthello_test.go
+@@ -0,0 +1,105 @@
++package forwarder
++
++import (
++	"bytes"
++	"crypto/tls"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestReadClientHello(t *testing.T) {
++	client, proxy := net.Pipe()
++	defer client.Close()
++	defer proxy.Close()
++	finished := make(chan error, 1)
++	go func() {
++		finished <- tls.Client(client, &tls.Config{ServerName: "api.example.test", MinVersion: tls.VersionTLS12}).Handshake()
++	}()
++	name, prefix, err := readClientHello(proxy, time.Second)
++	if err != nil || name != "api.example.test" || len(prefix) == 0 {
++		t.Fatalf("readClientHello = %q, %d bytes, %v", name, len(prefix), err)
++	}
++	proxy.Close()
++	_ = <-finished
++}
++
++func TestReadClientHelloRejectsNonTLS(t *testing.T) {
++	client, proxy := net.Pipe()
++	defer client.Close()
++	defer proxy.Close()
++	go func() { _, _ = io.Copy(client, bytes.NewBufferString("GET / HTTP/1.0\r\n\r\n")); client.Close() }()
++	if _, _, err := readClientHello(proxy, time.Second); err == nil {
++		t.Fatal("accepted non-TLS input")
++	}
++}
++
++func TestReadClientHelloRejectsMissingSNI(t *testing.T) {
++	client, proxy := net.Pipe()
++	defer client.Close()
++	defer proxy.Close()
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		_ = tls.Client(client, &tls.Config{ServerName: "127.0.0.1", MinVersion: tls.VersionTLS12}).Handshake()
++	}()
++	if _, _, err := readClientHello(proxy, time.Second); err == nil {
++		t.Fatal("accepted absent SNI")
++	}
++	proxy.Close()
++	<-done
++}
++
++func TestReadClientHelloTimeout(t *testing.T) {
++	client, proxy := net.Pipe()
++	defer client.Close()
++	defer proxy.Close()
++	if _, _, err := readClientHello(proxy, 10*time.Millisecond); err == nil {
++		t.Fatal("accepted stalled handshake")
++	}
++}
++
++func TestReplayConn(t *testing.T) {
++	a, b := net.Pipe()
++	defer a.Close()
++	defer b.Close()
++	go func() { _, _ = b.Write([]byte("tail")); b.Close() }()
++	c := &replayConn{Conn: a, reader: io.MultiReader(bytes.NewReader([]byte("prefix")), a)}
++	got, err := io.ReadAll(c)
++	if err != nil || string(got) != "prefixtail" {
++		t.Fatalf("replay = %q, %v", got, err)
++	}
++}
++
++type memoryConn struct {
++	input  io.Reader
++	output bytes.Buffer
++}
++
++func (c *memoryConn) Read(p []byte) (int, error)       { return c.input.Read(p) }
++func (c *memoryConn) Write(p []byte) (int, error)      { return c.output.Write(p) }
++func (c *memoryConn) Close() error                     { return nil }
++func (c *memoryConn) LocalAddr() net.Addr              { return nil }
++func (c *memoryConn) RemoteAddr() net.Addr             { return nil }
++func (c *memoryConn) SetDeadline(time.Time) error      { return nil }
++func (c *memoryConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *memoryConn) SetWriteDeadline(time.Time) error { return nil }
++
++func FuzzReadClientHello(f *testing.F) {
++	capture := &memoryConn{input: bytes.NewReader(nil)}
++	_ = tls.Client(capture, &tls.Config{ServerName: "api.example.test", MinVersion: tls.VersionTLS12}).Handshake()
++	f.Add(bytes.Clone(capture.output.Bytes()))
++	f.Add([]byte("GET / HTTP/1.1\r\n\r\n"))
++	f.Add([]byte{0x16, 0x03, 0x03, 0xff, 0xff})
++	f.Fuzz(func(t *testing.T, input []byte) {
++		if len(input) > 2*maxClientHelloBytes {
++			t.Skip()
++		}
++		c := &memoryConn{input: bytes.NewReader(input)}
++		name, prefix, err := readClientHello(c, time.Second)
++		if err == nil && (name == "" || len(prefix) > maxClientHelloBytes || !bytes.HasPrefix(input, prefix)) {
++			t.Fatalf("invalid successful parse: name=%q prefix length=%d", name, len(prefix))
++		}
++	})
++}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index 6a1f548a..3532b55c 100644
+index 6a1f548..2b5ffba 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
-@@ -7,6 +7,7 @@ import (
+@@ -1,12 +1,15 @@
+ package forwarder
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"fmt"
++	"io"
+ 	"net"
  	"sync"
  	"time"
  
@@ -481,7 +1189,7 @@ index 6a1f548a..3532b55c 100644
  	"github.com/inetaf/tcpproxy"
  	log "github.com/sirupsen/logrus"
  	"gvisor.dev/gvisor/pkg/tcpip"
-@@ -23,7 +24,7 @@ const (
+@@ -23,15 +26,26 @@ const (
  	defaultTCPConnectTimeout = 30 * time.Second
  )
  
@@ -490,35 +1198,248 @@ index 6a1f548a..3532b55c 100644
  	if maxInFlight <= 0 {
  		maxInFlight = defaultTCPMaxInFlight
  	}
-@@ -43,12 +44,26 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 	if connectTimeout <= 0 {
+ 		connectTimeout = defaultTCPConnectTimeout
+ 	}
++	pending := make(chan struct{}, maxInFlight)
+ 	return tcp.NewForwarder(s, 0, maxInFlight, func(r *tcp.ForwarderRequest) {
++		select {
++		case pending <- struct{}{}:
++		default:
++			r.Complete(true)
++			return
++		}
++		var releaseOnce sync.Once
++		release := func() { releaseOnce.Do(func() { <-pending }) }
++		defer release()
+ 		localAddress := r.ID().LocalAddress
++		port := r.ID().LocalPort
+ 
+ 		if (!ec2MetadataAccess) && linkLocal().Contains(localAddress) {
+ 			r.Complete(true)
+@@ -43,32 +57,62 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
  			localAddress = replaced
  		}
  		natLock.Unlock()
-+		if !policy.Allows("tcp", localAddress.String(), r.ID().LocalPort) {
-+			log.Debugf("egress policy denied tcp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
-+			r.Complete(true)
-+			return
-+		}
- 		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
- 		if err != nil {
- 			log.Tracef("net.DialTimeout() = %v", err)
+-		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
+-		if err != nil {
+-			log.Tracef("net.DialTimeout() = %v", err)
++		direct, candidate := policy.TCPRoute(localAddress.String(), port)
++		if !direct && !candidate {
++			policy.AuditTCP(localAddress.String(), port, false, "no-matching-rule")
  			r.Complete(true)
  			return
  		}
-+		flowID := policy.Track("tcp", localAddress.String(), r.ID().LocalPort, outbound)
+-
+ 		var wq waiter.Queue
+ 		ep, tcpErr := r.CreateEndpoint(&wq)
+ 		r.Complete(false)
+ 		if tcpErr != nil {
+-			if _, ok := tcpErr.(*tcpip.ErrConnectionRefused); ok {
+-				// transient error
+-				log.Debugf("r.CreateEndpoint() = %v", tcpErr)
+-			} else {
+-				log.Errorf("r.CreateEndpoint() = %v", tcpErr)
++			log.Debugf("r.CreateEndpoint() = %v", tcpErr)
++			return
++		}
++		guest := gonet.NewTCPConn(&wq, ep)
++		defer guest.Close()
++		var name string
++		var prefix []byte
++		if !direct {
++			var err error
++			name, prefix, err = readClientHello(guest, connectTimeout)
++			if err != nil || !policy.AllowsDomain(localAddress.String(), port, name) {
++				policy.AuditTCP(localAddress.String(), port, false, "tls-name-denied")
++				return
+ 			}
++		}
++		release()
++		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(port)), connectTimeout)
++		if err != nil {
+ 			return
+ 		}
++		defer outbound.Close()
++		var flowID uint64
++		if direct {
++			flowID = policy.TrackDirect(localAddress.String(), port, outbound)
++		} else {
++			flowID = policy.TrackDomain(localAddress.String(), port, name, outbound)
++		}
 +		if flowID == 0 && policy.Enabled() {
-+			_ = outbound.Close()
-+			r.Complete(true)
++			policy.AuditTCP(localAddress.String(), port, false, "policy-changed")
 +			return
 +		}
 +		if flowID != 0 {
++			policy.AuditTCP(localAddress.String(), port, true, "flow-allowed")
 +			defer policy.Untrack(flowID)
 +		}
++		var input net.Conn = guest
++		if len(prefix) != 0 {
++			input = &replayConn{Conn: guest, reader: io.MultiReader(bytes.NewReader(prefix), guest)}
++		}
  
- 		var wq waiter.Queue
- 		ep, tcpErr := r.CreateEndpoint(&wq)
+ 		remote := tcpproxy.DialProxy{
+ 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+ 				return outbound, nil
+ 			},
+ 		}
+-		remote.HandleConn(gonet.NewTCPConn(&wq, ep))
++		remote.HandleConn(input)
+ 	})
+ }
+ 
+diff --git a/pkg/services/forwarder/tcp_policy_test.go b/pkg/services/forwarder/tcp_policy_test.go
+new file mode 100644
+index 0000000..0c265cc
+--- /dev/null
++++ b/pkg/services/forwarder/tcp_policy_test.go
+@@ -0,0 +1,142 @@
++package forwarder
++
++import (
++	"context"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"io"
++	"math/big"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/containers/gvisor-tap-vsock/pkg/types"
++	"gvisor.dev/gvisor/pkg/tcpip"
++	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
++	"gvisor.dev/gvisor/pkg/tcpip/header"
++	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
++	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
++	"gvisor.dev/gvisor/pkg/tcpip/stack"
++	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
++)
++
++func TestTCPPolicyForwarding(t *testing.T) {
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	certTemplate := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"api.example.test"}, NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, BasicConstraintsValid: true}
++	der, err := x509.CreateCertificate(rand.Reader, certTemplate, certTemplate, &key.PublicKey, key)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert, err := x509.ParseCertificate(der)
++	if err != nil {
++		t.Fatal(err)
++	}
++	roots := x509.NewCertPool()
++	roots.AddCert(cert)
++	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") }))
++	backend.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS12}
++	backend.StartTLS()
++	defer backend.Close()
++	target, err := url.Parse(backend.URL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, portString, err := net.SplitHostPort(target.Host)
++	if err != nil {
++		t.Fatal(err)
++	}
++	n, err := strconv.Atoi(portString)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n < 1 || n > 65535 {
++		t.Fatal("invalid backend port")
++	}
++	port := uint16(n) //nolint:gosec // n is checked to be in the uint16 port range above.
++	policy := &types.EgressPolicy{Revision: "1", Allow: []types.EgressRule{{Protocol: "tcp", Domain: "api.example.test", Port: port}}}
++	holder, err := types.NewEgressPolicyHolder(policy, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}})
++	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}, TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol}})
++	defer s.Close()
++	if e := s.CreateNIC(1, loopback.New()); e != nil {
++		t.Fatal(e)
++	}
++	source := tcpip.AddrFrom4([4]byte{10, 0, 2, 100})
++	if e := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: source.WithPrefix()}, stack.AddressProperties{}); e != nil {
++		t.Fatal(e)
++	}
++	s.SetSpoofing(1, true)
++	s.SetPromiscuousMode(1, true)
++	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
++	virtual := tcpip.AddrFrom4([4]byte{198, 51, 100, 42})
++	var mu sync.Mutex
++	fw := TCP(s, map[tcpip.Address]tcpip.Address{virtual: tcpip.AddrFrom4([4]byte{127, 0, 0, 1})}, &mu, false, 16, 2*time.Second, holder)
++	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fw.HandlePacket)
++	dial := func(name string) (string, error) {
++		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++		defer cancel()
++		c, e := gonet.DialContextTCP(ctx, s, tcpip.FullAddress{NIC: 1, Addr: virtual, Port: port}, ipv4.ProtocolNumber)
++		if e != nil {
++			return "", e
++		}
++		defer c.Close()
++		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
++		tlsConn := tls.Client(c, &tls.Config{ServerName: name, RootCAs: roots, MinVersion: tls.VersionTLS12})
++		if e = tlsConn.Handshake(); e != nil {
++			return "", e
++		}
++		if _, e = io.WriteString(tlsConn, "GET / HTTP/1.0\r\nHost: api.example.test\r\n\r\n"); e != nil {
++			return "", e
++		}
++		data, e := io.ReadAll(tlsConn)
++		return string(data), e
++	}
++	got, err := dial("api.example.test")
++	if err != nil || !strings.Contains(got, "ok") {
++		t.Fatalf("allowed TLS: %q, %v", got, err)
++	}
++	if _, err := dial("other.example.test"); err == nil {
++		t.Fatal("wrong SNI was accepted")
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	active, err := gonet.DialContextTCP(ctx, s, tcpip.FullAddress{NIC: 1, Addr: virtual, Port: port}, ipv4.ProtocolNumber)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer active.Close()
++	_ = active.SetDeadline(time.Now().Add(3 * time.Second))
++	secure := tls.Client(active, &tls.Config{ServerName: "api.example.test", RootCAs: roots, MinVersion: tls.VersionTLS12})
++	if err := secure.Handshake(); err != nil {
++		t.Fatalf("active flow: %v", err)
++	}
++	if err := holder.Update(&types.EgressPolicy{Revision: "2"}); err != nil {
++		t.Fatal(err)
++	}
++	_, err = secure.Read(make([]byte, 1))
++	if err == nil {
++		t.Fatal("active flow survived revocation")
++	}
++	if e, ok := err.(net.Error); ok && e.Timeout() {
++		t.Fatalf("revocation timed out: %v", err)
++	}
++	if _, err := dial("api.example.test"); err == nil {
++		t.Fatal("revoked TLS was accepted")
++	}
++}
 diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
-index 12694496..eb985d5d 100644
+index 1269449..eb985d5 100644
 --- a/pkg/services/forwarder/udp.go
 +++ b/pkg/services/forwarder/udp.go
 @@ -5,6 +5,7 @@ import (
@@ -566,7 +1487,7 @@ index 12694496..eb985d5d 100644
  
  			// note that at this point packets that are sent to the current forwarder session
 diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
-index 613b32a1..37964e24 100644
+index 613b32a..37964e2 100644
 --- a/pkg/types/configuration.go
 +++ b/pkg/types/configuration.go
 @@ -34,6 +34,11 @@ type Configuration struct {
@@ -594,10 +1515,10 @@ index 613b32a1..37964e24 100644
  type Protocol string
 diff --git a/pkg/types/egress_policy.go b/pkg/types/egress_policy.go
 new file mode 100644
-index 00000000..a1db17ba
+index 0000000..6e19e7d
 --- /dev/null
 +++ b/pkg/types/egress_policy.go
-@@ -0,0 +1,662 @@
+@@ -0,0 +1,966 @@
 +package types
 +
 +import (
@@ -701,6 +1622,7 @@ index 00000000..a1db17ba
 +
 +type resolvedBinding struct {
 +	name    string
++	aliases []string
 +	expires time.Time
 +}
 +
@@ -789,18 +1711,30 @@ index 00000000..a1db17ba
 +		if rest == "" || strings.Contains(rest, "*") {
 +			return nil, fmt.Errorf("invalid domain %q", pattern)
 +		}
-+		expression = `^.+\.` + regexp.QuoteMeta(rest) + `$`
++		glob, err := domainGlobExpression(rest)
++		if err != nil {
++			return nil, fmt.Errorf("invalid domain %q: %w", pattern, err)
++		}
++		expression = `^([^.]+\.)+` + glob + `$`
 +	case strings.HasPrefix(pattern, "*."):
 +		rest := pattern[2:]
 +		if rest == "" || strings.Contains(rest, "*") {
 +			return nil, fmt.Errorf("invalid domain %q", pattern)
 +		}
-+		expression = `^[^.]+\.` + regexp.QuoteMeta(rest) + `$`
++		glob, err := domainGlobExpression(rest)
++		if err != nil {
++			return nil, fmt.Errorf("invalid domain %q: %w", pattern, err)
++		}
++		expression = `^[^.]+\.` + glob + `$`
 +	default:
 +		if strings.Contains(pattern, "*") {
 +			return nil, fmt.Errorf("invalid domain %q", pattern)
 +		}
-+		expression = `^` + domainGlobExpression(pattern) + `$`
++		glob, err := domainGlobExpression(pattern)
++		if err != nil {
++			return nil, fmt.Errorf("invalid domain %q: %w", pattern, err)
++		}
++		expression = `^` + glob + `$`
 +	}
 +	compiled, err := regexp.Compile(expression)
 +	if err != nil {
@@ -809,7 +1743,7 @@ index 00000000..a1db17ba
 +	return compiled, nil
 +}
 +
-+func domainGlobExpression(pattern string) string {
++func domainGlobExpression(pattern string) (string, error) {
 +	var b strings.Builder
 +	for i := 0; i < len(pattern); i++ {
 +		c := pattern[i]
@@ -819,20 +1753,24 @@ index 00000000..a1db17ba
 +		case '[':
 +			end := strings.IndexByte(pattern[i+1:], ']')
 +			if end < 0 {
-+				b.WriteString(`\[`)
-+				continue
++				return "", fmt.Errorf("unterminated domain character class")
 +			}
 +			class := pattern[i+1 : i+1+end]
++			if class == "" || class == "!" || strings.ContainsAny(class, ".^\\") {
++				return "", fmt.Errorf("invalid domain character class")
++			}
 +			if strings.HasPrefix(class, "!") {
-+				class = "^" + class[1:]
++				class = "^." + class[1:]
 +			}
 +			b.WriteString("[" + class + "]")
 +			i += end + 1
++		case ']':
++			return "", fmt.Errorf("unmatched domain character class")
 +		default:
 +			b.WriteString(regexp.QuoteMeta(string(c)))
 +		}
 +	}
-+	return b.String()
++	return b.String(), nil
 +}
 +
 +func compileEgressPolicy(policy *EgressPolicy) (*egressSnapshot, error) {
@@ -843,6 +1781,27 @@ index 00000000..a1db17ba
 +	deny, err := compileEgressRules("deny", policy.Deny, false)
 +	if err != nil {
 +		return nil, err
++	}
++	// A domain deny cannot be enforced when an overlapping IP rule grants
++	// direct access without revealing a hostname. Reject that configuration.
++	for _, denied := range deny {
++		if denied.domain == nil {
++			continue
++		}
++		if denied.protocol == "udp" {
++			return nil, fmt.Errorf("UDP domain policy is unsupported")
++		}
++		for _, granted := range allow {
++			if granted.domain == nil && granted.protocol == denied.protocol &&
++				(granted.port == 0 || denied.port == 0 || granted.port == denied.port) {
++				return nil, fmt.Errorf("domain deny conflicts with direct IP allow; enforcement unsupported")
++			}
++		}
++	}
++	for _, granted := range allow {
++		if granted.domain != nil && granted.protocol == "udp" {
++			return nil, fmt.Errorf("UDP domain policy is unsupported")
++		}
 +	}
 +	revision := policy.Revision
 +	if revision == "" {
@@ -913,6 +1872,7 @@ index 00000000..a1db17ba
 +// holder, or a holder with no policy, preserves the upstream permissive
 +// behavior only when the holder was created without required=true.
 +type trackedEgressFlow struct {
++	name     string
 +	protocol string
 +	address  string
 +	port     uint16
@@ -928,7 +1888,9 @@ index 00000000..a1db17ba
 +	nextFlowID uint64
 +	// resolved maps a DNS answer IP to the names that produced it. It is
 +	// bounded and expires so a hostile resolver cannot grow it without limit.
-+	resolved map[string][]resolvedBinding
++	resolved       map[string][]resolvedBinding
++	dnsRequests    map[string]uint64
++	nextDNSRequest uint64
 +}
 +
 +func NewEgressPolicyHolder(policy *EgressPolicy, required bool) (*EgressPolicyHolder, error) {
@@ -1013,6 +1975,9 @@ index 00000000..a1db17ba
 +	h.snapshot = snapshot
 +	for id, flow := range h.flows {
 +		allowed, rule := snapshot.decide(flow.protocol, flow.address, flow.port)
++		if flow.name != "" {
++			allowed = (allowed || rule == "default-deny") && h.nameAllowedLocked(flow.protocol, flow.address, flow.port, flow.name)
++		}
 +		if allowed {
 +			continue
 +		}
@@ -1056,7 +2021,7 @@ index 00000000..a1db17ba
 +		return 0
 +	}
 +	allowed, rule := snapshot.decide(protocol, address, port)
-+	if !allowed && rule == "default-deny" {
++	if protocol != "udp" && !allowed && rule == "default-deny" {
 +		if name, ok := h.resolvedNameLocked(protocol, address, port); ok {
 +			allowed = true
 +			rule = "allow:domain " + name
@@ -1085,6 +2050,140 @@ index 00000000..a1db17ba
 +	return id
 +}
 +
++// AuditTCP records a decision without storing a TLS name or payload.
++func (h *EgressPolicyHolder) AuditTCP(address string, port uint16, allowed bool, reason string) {
++	if h == nil {
++		return
++	}
++	h.mu.RLock()
++	snapshot, audit := h.snapshot, h.audit
++	h.mu.RUnlock()
++	if snapshot == nil || audit == nil {
++		return
++	}
++	action := "deny"
++	if allowed {
++		action = "allow"
++	}
++	_ = audit.record(EgressDecision{SandboxID: snapshot.sandboxID, Revision: snapshot.revision, Protocol: "tcp", Destination: address, Port: port, Action: action, Rule: reason})
++}
++
++// TCPRoute distinguishes direct CIDR authorization from a domain candidate.
++func (h *EgressPolicyHolder) TCPRoute(address string, port uint16) (direct, candidate bool) {
++	if h == nil {
++		return true, false
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	if h.snapshot == nil {
++		return true, false
++	}
++	allowed, reason := h.snapshot.decide("tcp", address, port)
++	if allowed {
++		return true, false
++	}
++	if reason != "default-deny" {
++		return false, false
++	}
++	_, candidate = h.resolvedNameLocked("tcp", address, port)
++	return false, candidate
++}
++
++func (h *EgressPolicyHolder) nameAllowedLocked(protocol, address string, port uint16, name string) bool {
++	ip := net.ParseIP(address)
++	if ip == nil || name == "" {
++		return false
++	}
++	normalized := strings.TrimSuffix(strings.ToLower(name), ".")
++	found := false
++	for _, binding := range h.resolved[ip.String()] {
++		if binding.name == normalized && binding.expires.After(time.Now()) && !h.aliasDeniedLocked(binding.aliases) {
++			found = true
++			break
++		}
++	}
++	if !found {
++		return false
++	}
++	for _, rule := range h.snapshot.deny {
++		if rule.matchesDomain(protocol, normalized, port) {
++			return false
++		}
++	}
++	for _, rule := range h.snapshot.allow {
++		if rule.matchesDomain(protocol, normalized, port) {
++			return true
++		}
++	}
++	return false
++}
++
++func (h *EgressPolicyHolder) aliasDeniedLocked(aliases []string) bool {
++	for _, alias := range aliases {
++		for _, rule := range h.snapshot.deny {
++			if rule.matchesName(alias) {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++// TrackDirect registers only a flow authorized by an IP-based rule.
++func (h *EgressPolicyHolder) TrackDirect(address string, port uint16, closer io.Closer) uint64 {
++	if h == nil || closer == nil {
++		return 0
++	}
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.snapshot == nil {
++		return 0
++	}
++	allowed, _ := h.snapshot.decide("tcp", address, port)
++	if !allowed {
++		return 0
++	}
++	h.nextFlowID++
++	id := h.nextFlowID
++	h.flows[id] = trackedEgressFlow{protocol: "tcp", address: address, port: port, closer: closer}
++	return id
++}
++
++// AllowsDomain checks a TLS name against the current DNS binding and policy.
++func (h *EgressPolicyHolder) AllowsDomain(address string, port uint16, name string) bool {
++	if h == nil {
++		return false
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	if h.snapshot == nil {
++		return false
++	}
++	allowed, reason := h.snapshot.decide("tcp", address, port)
++	return (allowed || reason == "default-deny") && h.nameAllowedLocked("tcp", address, port, name)
++}
++
++// TrackDomain atomically verifies the DNS binding and current policy and records
++// the verified TLS name for subsequent policy reloads.
++func (h *EgressPolicyHolder) TrackDomain(address string, port uint16, name string, closer io.Closer) uint64 {
++	if h == nil || closer == nil {
++		return 0
++	}
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.snapshot == nil {
++		return 0
++	}
++	allowed, reason := h.snapshot.decide("tcp", address, port)
++	if (!allowed && reason != "default-deny") || !h.nameAllowedLocked("tcp", address, port, name) {
++		return 0
++	}
++	h.nextFlowID++
++	id := h.nextFlowID
++	h.flows[id] = trackedEgressFlow{protocol: "tcp", address: address, port: port, name: name, closer: closer}
++	return id
++}
++
 +// Untrack removes a flow that ended normally. It is safe to call after Close
 +// or after a policy revocation already removed the flow.
 +func (h *EgressPolicyHolder) Untrack(id uint64) {
@@ -1109,7 +2208,7 @@ index 00000000..a1db17ba
 +	rule := "no-policy"
 +	if snapshot != nil {
 +		allowed, rule = snapshot.decide(protocol, address, port)
-+		if !allowed && rule == "default-deny" {
++		if protocol != "udp" && !allowed && rule == "default-deny" {
 +			if name, ok := h.resolvedNameLocked(protocol, address, port); ok {
 +				allowed = true
 +				rule = "allow:domain " + name
@@ -1172,43 +2271,169 @@ index 00000000..a1db17ba
 +	return false
 +}
 +
-+// RecordDNS remembers addresses returned for an authorized name. A bounded
-+// ten-minute cache is consulted by Allows for domain-only rules.
-+func (h *EgressPolicyHolder) RecordDNS(name string, addresses []net.IPAddr) {
-+	if h == nil || len(addresses) == 0 || !h.DNSAllowed(name) {
-+		return
++// DNSDenied reports explicit domain denies for aliases in a DNS answer.
++func (h *EgressPolicyHolder) DNSDenied(name string) bool {
++	if h == nil {
++		return false
 +	}
-+	normalized := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-+	now := time.Now()
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	if h.snapshot == nil {
++		return false
++	}
++	for _, rule := range h.snapshot.deny {
++		if rule.matchesName(name) {
++			return true
++		}
++	}
++	return false
++}
++
++// BeginDNS starts the newest lookup for a name and address family. Older
++// in-flight responses cannot restore bindings after a newer lookup completes.
++func (h *EgressPolicyHolder) BeginDNS(name string, family int) uint64 {
++	if h == nil || (family != 4 && family != 6) || !h.DNSAllowed(name) {
++		return 0
++	}
++	key := fmt.Sprintf("%d:%s", family, strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), "."))
 +	h.mu.Lock()
 +	defer h.mu.Unlock()
 +	if h.snapshot == nil {
-+		return
++		return 0
 +	}
++	if h.dnsRequests == nil {
++		h.dnsRequests = make(map[string]uint64)
++	}
++	if _, exists := h.dnsRequests[key]; !exists && len(h.dnsRequests) >= 4096 {
++		return 0
++	}
++	h.nextDNSRequest++
++	if h.nextDNSRequest == 0 {
++		h.nextDNSRequest++
++	}
++	h.dnsRequests[key] = h.nextDNSRequest
++	return h.nextDNSRequest
++}
++
++// RecordDNS retains the legacy fixture interface without TTL metadata.
++func (h *EgressPolicyHolder) RecordDNS(name string, addresses []net.IPAddr) {
++	h.RecordDNSAnswer(name, addresses, 10*time.Minute, 0)
++}
++
++// RecordDNSAnswer is useful for isolated callers with explicit TTL metadata.
++func (h *EgressPolicyHolder) RecordDNSAnswer(name string, addresses []net.IPAddr, ttl time.Duration, family int, aliases ...string) {
++	h.commitDNS(name, addresses, ttl, family, 0, aliases)
++}
++
++// CommitDNS accepts only the newest started lookup. A zero TTL clears grants.
++func (h *EgressPolicyHolder) CommitDNS(name string, addresses []net.IPAddr, ttl time.Duration, family int, generation uint64, aliases ...string) bool {
++	if generation == 0 {
++		return false
++	}
++	return h.commitDNS(name, addresses, ttl, family, generation, aliases)
++}
++
++func (h *EgressPolicyHolder) commitDNS(name string, addresses []net.IPAddr, ttl time.Duration, family int, generation uint64, aliases []string) bool {
++	if h == nil || len(aliases) > 16 || (family != 0 && family != 4 && family != 6) {
++		return false
++	}
++	if ttl < 0 {
++		ttl = 0
++	}
++	if ttl > 10*time.Minute {
++		ttl = 10 * time.Minute
++	}
++	normalized := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
++	key := fmt.Sprintf("%d:%s", family, normalized)
++	now := time.Now()
++	h.mu.Lock()
++	refresh := false
++	defer func() {
++		type revocation struct {
++			closer   io.Closer
++			decision EgressDecision
++		}
++		var revoked []revocation
++		if refresh && h.snapshot != nil {
++			for id, flow := range h.flows {
++				ip := net.ParseIP(flow.address)
++				matchingFamily := family == 0 || (ip != nil && ((family == 4 && ip.To4() != nil) || (family == 6 && ip.To4() == nil)))
++				if flow.name == normalized && matchingFamily && !h.nameAllowedLocked(flow.protocol, flow.address, flow.port, flow.name) {
++					delete(h.flows, id)
++					revoked = append(revoked, revocation{closer: flow.closer, decision: EgressDecision{SandboxID: h.snapshot.sandboxID, Revision: h.snapshot.revision, Protocol: flow.protocol, Destination: flow.address, Port: flow.port, Action: "deny", Rule: "revoke:dns-binding"}})
++				}
++			}
++		}
++		audit := h.audit
++		h.mu.Unlock()
++		for _, item := range revoked {
++			_ = item.closer.Close()
++			if audit != nil {
++				_ = audit.record(item.decision)
++			}
++		}
++	}()
++	if generation != 0 {
++		if h.dnsRequests[key] != generation {
++			return false
++		}
++		delete(h.dnsRequests, key)
++	}
++	if h.snapshot == nil {
++		return false
++	}
++	refresh = true
 +	if h.resolved == nil {
 +		h.resolved = make(map[string][]resolvedBinding)
 +	}
-+	if len(h.resolved) > 4096 {
++	for address, entries := range h.resolved {
++		kept := entries[:0]
++		ip := net.ParseIP(address)
++		matchingFamily := family == 0 || (ip != nil && ((family == 4 && ip.To4() != nil) || (family == 6 && ip.To4() == nil)))
++		for _, binding := range entries {
++			if binding.expires.After(now) && (binding.name != normalized || !matchingFamily) {
++				kept = append(kept, binding)
++			}
++		}
++		if len(kept) == 0 {
++			delete(h.resolved, address)
++		} else {
++			h.resolved[address] = kept
++		}
++	}
++	if len(h.resolved) >= 4096 {
 +		h.resolved = make(map[string][]resolvedBinding)
++	}
++	if h.aliasDeniedLocked(aliases) {
++		return false
++	}
++	for _, rule := range h.snapshot.deny {
++		if rule.matchesName(normalized) {
++			return false
++		}
 +	}
 +	for _, address := range addresses {
 +		ip := address.IP
-+		if ip == nil {
++		if ttl == 0 || ip == nil || (family == 4 && ip.To4() == nil) || (family == 6 && (ip.To16() == nil || ip.To4() != nil)) {
 +			continue
 +		}
-+		key := ip.String()
-+		bindings := h.resolved[key][:0]
-+		for _, binding := range h.resolved[key] {
++		ipKey := ip.String()
++		if _, exists := h.resolved[ipKey]; !exists && len(h.resolved) >= 4096 {
++			continue
++		}
++		bindings := h.resolved[ipKey][:0]
++		for _, binding := range h.resolved[ipKey] {
 +			if binding.expires.After(now) && binding.name != normalized {
 +				bindings = append(bindings, binding)
 +			}
 +		}
-+		bindings = append(bindings, resolvedBinding{name: normalized, expires: now.Add(10 * time.Minute)})
++		bindings = append(bindings, resolvedBinding{name: normalized, aliases: append([]string(nil), aliases...), expires: now.Add(ttl)})
 +		if len(bindings) > 32 {
 +			bindings = bindings[len(bindings)-32:]
 +		}
-+		h.resolved[key] = bindings
++		h.resolved[ipKey] = bindings
 +	}
++	return true
 +}
 +
 +func (h *EgressPolicyHolder) resolvedNameLocked(protocol, address string, port uint16) (string, bool) {
@@ -1227,7 +2452,7 @@ index 00000000..a1db17ba
 +	snapshot := h.snapshot
 +	for i := len(bindings) - 1; i >= 0; i-- {
 +		binding := bindings[i]
-+		if !binding.expires.After(now) {
++		if !binding.expires.After(now) || h.aliasDeniedLocked(binding.aliases) {
 +			continue
 +		}
 +		for _, rule := range snapshot.deny {
@@ -1262,10 +2487,10 @@ index 00000000..a1db17ba
 +}
 diff --git a/pkg/types/egress_policy_test.go b/pkg/types/egress_policy_test.go
 new file mode 100644
-index 00000000..d9bee262
+index 0000000..96f996d
 --- /dev/null
 +++ b/pkg/types/egress_policy_test.go
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,534 @@
 +package types
 +
 +import (
@@ -1274,6 +2499,7 @@ index 00000000..d9bee262
 +	"path/filepath"
 +	"strings"
 +	"testing"
++	"time"
 +)
 +
 +func TestEgressPolicyAllowlist(t *testing.T) {
@@ -1590,8 +2816,217 @@ index 00000000..d9bee262
 +		}
 +	}
 +}
++
++func TestDomainTLSBindingAndRevocation(t *testing.T) {
++	policy := &EgressPolicy{Revision: "1", Allow: []EgressRule{{Protocol: "tcp", Domain: "api.example.test", Port: 443}}}
++	holder, err := NewEgressPolicyHolder(policy, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}})
++	if direct, candidate := holder.TCPRoute("203.0.113.10", 443); direct || !candidate {
++		t.Fatal("expected domain candidate")
++	}
++	if !holder.AllowsDomain("203.0.113.10", 443, "api.example.test") {
++		t.Fatal("matching name denied")
++	}
++	if holder.AllowsDomain("203.0.113.10", 443, "other.example.test") {
++		t.Fatal("wrong name allowed")
++	}
++	if holder.AllowsDomain("203.0.113.11", 443, "api.example.test") {
++		t.Fatal("unbound address allowed")
++	}
++	a, b := net.Pipe()
++	defer a.Close()
++	defer b.Close()
++	if id := holder.TrackDomain("203.0.113.10", 443, "api.example.test", a); id == 0 {
++		t.Fatal("matching flow denied")
++	}
++	if err := holder.Update(&EgressPolicy{Revision: "2"}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := a.Write([]byte("x")); err == nil {
++		t.Fatal("revoked flow remained open")
++	}
++}
++
++func TestDomainDenyConflictingIPAllowRejected(t *testing.T) {
++	cases := []struct {
++		name     string
++		allow    EgressRule
++		deny     EgressRule
++		rejected bool
++	}{
++		{"overlap", EgressRule{Protocol: "tcp", CIDR: "0.0.0.0/0"}, EgressRule{Protocol: "tcp", Domain: "blocked.example.test", Port: 443}, true},
++		{"different ports", EgressRule{Protocol: "tcp", CIDR: "192.0.2.0/24", Port: 80}, EgressRule{Protocol: "tcp", Domain: "blocked.example.test", Port: 443}, false},
++		{"domain positive control", EgressRule{Protocol: "tcp", Domain: "allowed.example.test"}, EgressRule{Protocol: "tcp", Domain: "blocked.example.test"}, false},
++		{"udp domain unsupported", EgressRule{Protocol: "udp", Domain: "allowed.example.test"}, EgressRule{Protocol: "tcp", Domain: "blocked.example.test"}, true},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := NewEgressPolicyHolder(&EgressPolicy{Allow: []EgressRule{tc.allow}, Deny: []EgressRule{tc.deny}}, true)
++			if (err != nil) != tc.rejected {
++				t.Fatalf("rejected=%v, err=%v", tc.rejected, err)
++			}
++		})
++	}
++}
++
++func TestDNSReresolutionReplacesBindings(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{Allow: []EgressRule{{Protocol: "tcp", Domain: "api.example.test", Port: 443}}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	record := func(ip string) { holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP(ip)}}) }
++	record("192.0.2.1")
++	if !holder.AllowsDomain("192.0.2.1", 443, "api.example.test") {
++		t.Fatal("initial binding denied")
++	}
++	record("192.0.2.2")
++	if holder.AllowsDomain("192.0.2.1", 443, "api.example.test") {
++		t.Fatal("old address survived re-resolution")
++	}
++	if !holder.AllowsDomain("192.0.2.2", 443, "api.example.test") {
++		t.Fatal("new address denied")
++	}
++	holder.RecordDNS("api.example.test", nil)
++	if holder.AllowsDomain("192.0.2.2", 443, "api.example.test") {
++		t.Fatal("address survived failed resolution")
++	}
++}
++
++func TestDNSAliasDenyReloadRevokesFlow(t *testing.T) {
++	allow := EgressRule{Protocol: "tcp", Domain: "api.example.test", Port: 443}
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{Revision: "1", Allow: []EgressRule{allow}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	holder.RecordDNSAnswer("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.10")}}, time.Minute, 4, "cdn.example.test")
++	if !holder.AllowsDomain("192.0.2.10", 443, "api.example.test") {
++		t.Fatal("allowed alias was denied")
++	}
++	a, b := net.Pipe()
++	defer a.Close()
++	defer b.Close()
++	if holder.TrackDomain("192.0.2.10", 443, "api.example.test", a) == 0 {
++		t.Fatal("allowed flow not tracked")
++	}
++	policy := &EgressPolicy{Revision: "2", Allow: []EgressRule{allow}, Deny: []EgressRule{{Protocol: "tcp", Domain: "cdn.example.test", Port: 443}}}
++	if err := holder.Update(policy); err != nil {
++		t.Fatal(err)
++	}
++	if holder.AllowsDomain("192.0.2.10", 443, "api.example.test") {
++		t.Fatal("new alias deny not enforced")
++	}
++	if _, err := a.Write([]byte("x")); err == nil {
++		t.Fatal("flow survived alias deny")
++	}
++	holder.RecordDNSAnswer("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.10")}}, time.Minute, 4, "cdn.example.test")
++	if holder.AllowsDomain("192.0.2.10", 443, "api.example.test") {
++		t.Fatal("denied alias was recorded")
++	}
++}
++
++func TestDNSOlderResponseCannotRestoreStaleBinding(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{Allow: []EgressRule{{Protocol: "tcp", Domain: "api.example.test", Port: 443}}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	old := holder.BeginDNS("api.example.test", 4)
++	newer := holder.BeginDNS("api.example.test", 4)
++	if old == 0 || newer == 0 || old == newer {
++		t.Fatal("invalid lookup generations")
++	}
++	if !holder.CommitDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.2")}}, time.Minute, 4, newer) {
++		t.Fatal("new answer rejected")
++	}
++	if holder.CommitDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.1")}}, time.Minute, 4, old) {
++		t.Fatal("stale answer accepted")
++	}
++	if holder.AllowsDomain("192.0.2.1", 443, "api.example.test") || !holder.AllowsDomain("192.0.2.2", 443, "api.example.test") {
++		t.Fatal("stale response changed current binding")
++	}
++}
++
++func TestDNSRebindingRevokesActiveFlow(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{Allow: []EgressRule{{Protocol: "tcp", Domain: "api.example.test", Port: 443}}}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	first := holder.BeginDNS("api.example.test", 4)
++	if !holder.CommitDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.1")}}, time.Minute, 4, first) {
++		t.Fatal("initial DNS rejected")
++	}
++	a, b := net.Pipe()
++	defer a.Close()
++	defer b.Close()
++	if holder.TrackDomain("192.0.2.1", 443, "api.example.test", a) == 0 {
++		t.Fatal("initial flow rejected")
++	}
++	second := holder.BeginDNS("api.example.test", 4)
++	if !holder.CommitDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("192.0.2.2")}}, time.Minute, 4, second) {
++		t.Fatal("replacement DNS rejected")
++	}
++	if _, err := a.Write([]byte("x")); err == nil {
++		t.Fatal("old flow survived rebinding")
++	}
++	if holder.AllowsDomain("192.0.2.1", 443, "api.example.test") || !holder.AllowsDomain("192.0.2.2", 443, "api.example.test") {
++		t.Fatal("DNS replacement not enforced")
++	}
++}
++
++func TestDomainGlobLabelBoundaries(t *testing.T) {
++	for _, tc := range []struct {
++		pattern, name string
++		want          bool
++	}{
++		{"api?.example.test", "api1.example.test", true},
++		{"api?.example.test", "api.example.test", false},
++		{"api[!1].example.test", "api2.example.test", true},
++		{"api[!1].example.test", "api1.example.test", false},
++		{"api[!1]example.test", "api.example.test", false},
++		{"*.api?.example.test", "www.api1.example.test", true},
++		{"*.api?.example.test", "www.api.example.test", false},
++		{"**.example.test", "a..example.test", false},
++	} {
++		matcher, err := compileDomainRule(tc.pattern)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if got := matcher.MatchString(tc.name); got != tc.want {
++			t.Fatalf("%q on %q = %v, want %v", tc.pattern, tc.name, got, tc.want)
++		}
++	}
++	for _, bad := range []string{"api[.].example.test", "api[!.].example.test", "api[.example.test", "api].example.test", "api[!].example.test"} {
++		if _, err := compileDomainRule(bad); err == nil {
++			t.Fatalf("invalid pattern %q accepted", bad)
++		}
++	}
++}
++
++func FuzzCompileDomainRule(f *testing.F) {
++	f.Add("api?.example.test", "api1.example.test")
++	f.Add("api[!1].example.test", "api2.example.test")
++	f.Add("*.example.test", "host.example.test")
++	f.Add("api[.].example.test", "api.example.test")
++	f.Fuzz(func(t *testing.T, pattern, name string) {
++		if len(pattern) > 253 || len(name) > 253 {
++			t.Skip()
++		}
++		compiled, err := compileDomainRule(pattern)
++		if err != nil {
++			return
++		}
++		_ = compiled.MatchString(name)
++	})
++}
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index 3ed9a996..cd3c9012 100644
+index 3ed9a99..6bde7f7 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
 @@ -1,6 +1,7 @@
@@ -1639,7 +3074,7 @@ index 3ed9a996..cd3c9012 100644
  	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{
  		NIC:  1,
  		Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()),
-@@ -77,10 +80,22 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
+@@ -77,10 +80,25 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
  		return nil, err
  	}
  
@@ -1660,11 +3095,14 @@ index 3ed9a996..cd3c9012 100644
  		return nil, err
  	}
 +	server.SetEgressPolicy(egressPolicy)
++	if err := server.SetPolicyUpstream(configuration.DNSUpstream); err != nil {
++		return nil, err
++	}
  
  	go func() {
  		if err := server.Serve(); err != nil {
 diff --git a/pkg/virtualnetwork/virtualnetwork.go b/pkg/virtualnetwork/virtualnetwork.go
-index b2b44614..5f4ac70d 100644
+index b2b4461..5f4ac70 100644
 --- a/pkg/virtualnetwork/virtualnetwork.go
 +++ b/pkg/virtualnetwork/virtualnetwork.go
 @@ -30,6 +30,7 @@ type VirtualNetwork struct {

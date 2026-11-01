@@ -21,7 +21,14 @@ tests are recorded in the plan:
   domain-aware DNS authorization with a bounded resolved-IP cache, revision
   reload, audit, flow revocation, and the supervisor owner lease. The daemon
   requires the patched `-require-owner-lease` option; older gvproxy builds are
-  rejected at startup.
+  rejected at startup. Domain-only TCP authorization additionally requires a
+  bounded TLS ClientHello with a matching SNI and DNS binding. Policy DNS A/AAAA
+  lookups use the configured upstream, retry truncated UDP replies over TCP to
+  that upstream, follow bounded CNAME chains and expire bindings at the minimum
+  observed TTL. Encrypted Client Hello on the
+  domain-only path, domain-only UDP, and domain denies overlapping a direct IP
+  allow are rejected. HTTP Host and complete DNS-rebinding and bypass guarantees
+  are not established; the patch remains experimental.
 - `patches/nerdbox-gpt-threshold.patch` — raises nerdbox's GPT threshold from
   8 to 128 layers so multi-layer images stay on raw virtio EROFS disks instead
   of the GPT VMDK path that libkrun 1.19.6 rejects. Build the shim with
