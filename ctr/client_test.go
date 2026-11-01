@@ -485,10 +485,8 @@ func TestCreateMountsAndStartsProxyHelper(t *testing.T) {
 	if err := os.WriteFile(helper, []byte("synthetic helper"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := backend.Create(context.Background(), runtime.Config{
-		Name: "dev", Image: "img", ProxyPort: 1027, ProxySocket: "/tmp/kp-12345678/proxy.sock",
-		ProxyHelperPath: helper, ProxyGuestPort: 3128, ProxyServiceHost: "api.openai.com",
-	}); err != nil {
+	cfg := runtime.Config{Name: "dev", Image: "img", ProxyPort: 1027, ProxySocket: "/tmp/kp-12345678/proxy.sock"}
+	if _, err := backend.CreateWithProxy(context.Background(), &cfg, helper, 3128, "api.openai.com"); err != nil {
 		t.Fatal(err)
 	}
 	calls := fmt.Sprint(runner.calls)
