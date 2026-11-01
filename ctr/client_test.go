@@ -425,3 +425,33 @@ func TestBackendNetworkAnnotations(t *testing.T) {
 		t.Fatalf("network stops = %d", network.stopped)
 	}
 }
+
+func TestCreateRemovesContainerWhenRunFails(t *testing.T) {
+	listings := 0
+	runner := &fakeRunner{fn: func(args []string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "run --detach"):
+			return []byte("failed format"), errors.New("exit status 1")
+		case strings.Contains(joined, "containers ls -q"):
+			listings++
+			if listings == 1 {
+				return nil, nil // pre-create check: name is free
+			}
+			return []byte("klorq-dev\n"), nil // ctr left a partial container
+		}
+		return nil, nil
+	}}
+	backend, err := NewBackend(Config{Socket: "/tmp/containerd.sock", CTR: "ctr"}, BackendOptions{Image: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.client.runner = runner
+	if _, err := backend.Create(context.Background(), runtime.Config{Name: "dev", Image: "img"}); err == nil {
+		t.Fatal("failed run returned no error")
+	}
+	calls := fmt.Sprint(runner.calls)
+	if !strings.Contains(calls, "containers delete klorq-dev") {
+		t.Fatalf("partial container was not removed: %s", calls)
+	}
+}

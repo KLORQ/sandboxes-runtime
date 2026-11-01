@@ -98,12 +98,31 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 		spec.Mounts = append(spec.Mounts, Mount{Source: workspace.Path, Destination: workspace.Path, ReadOnly: workspace.ReadOnly})
 	}
 	if err := b.client.Run(ctx, spec); err != nil {
+		cleanupErr := b.cleanupFailedCreate(ctx, id)
 		if b.network != nil {
-			return runtime.Handle{}, errors.Join(err, b.stopNetwork(ctx, cfg.Name))
+			cleanupErr = errors.Join(cleanupErr, b.stopNetwork(ctx, cfg.Name))
 		}
-		return runtime.Handle{}, err
+		return runtime.Handle{}, errors.Join(err, cleanupErr)
 	}
 	return runtime.Handle{ID: id, FIFODir: fifoDir}, nil
+}
+
+// cleanupFailedCreate removes a container that ctr created before its run
+// failed. Without it a partial container keeps the sandbox name reserved and
+// every retry fails with "container already exists".
+func (b *Backend) cleanupFailedCreate(ctx context.Context, id string) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	exists, err := b.client.containerExists(cleanupCtx, id)
+	if err != nil || !exists {
+		return err
+	}
+	// A failed run may leave a task behind; ignore its absence.
+	_ = b.client.DeleteTask(cleanupCtx, id)
+	if err := b.client.DeleteContainer(cleanupCtx, id); err != nil {
+		return fmt.Errorf("remove container after failed create: %w", err)
+	}
+	return nil
 }
 
 // Handle returns the runtime handle for a sandbox name.
