@@ -84,6 +84,7 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 		MemoryMiB:   cfg.MemoryMiB,
 		FIFODir:     fifoDir,
 		Env:         append([]string(nil), cfg.Env...),
+		Privileged:  cfg.Privileged,
 		Annotations: append([]string(nil), attachment.Annotations...),
 	}
 	workspaces := cfg.Workspaces

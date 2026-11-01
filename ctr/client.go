@@ -128,6 +128,7 @@ type RunSpec struct {
 	FIFODir     string
 	Mounts      []Mount
 	Env         []string
+	Privileged  bool
 	Annotations []string
 	Args        []string
 }
@@ -153,6 +154,9 @@ func (c *Client) Run(ctx context.Context, spec RunSpec) error {
 	}
 	if spec.FIFODir != "" {
 		args = append(args, "--fifo-dir", spec.FIFODir)
+	}
+	if spec.Privileged {
+		args = append(args, "--cap-add", "CAP_SYS_ADMIN", "--cap-add", "CAP_NET_ADMIN", "--cap-add", "CAP_NET_RAW")
 	}
 	for _, annotation := range spec.Annotations {
 		args = append(args, "--annotation", annotation)

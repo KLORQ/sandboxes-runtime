@@ -50,6 +50,7 @@ type Config struct {
 	MemoryMiB  uint32
 	FIFODir    string
 	Env        []string
+	Privileged bool
 }
 
 // Handle identifies a runtime instance.
@@ -119,6 +120,12 @@ type ExecRequest struct {
 // a guest exit from a transport failure.
 type Executor interface {
 	Exec(ctx context.Context, h Handle, req ExecRequest) (int, error)
+}
+
+// NativeExecutor is implemented by runtimes that can run a guest process with
+// an explicit user/environment through the native containerd API.
+type NativeExecutor interface {
+	ExecNative(ctx context.Context, h Handle, req ExecRequest) (int, error)
 }
 
 // ContextWriter writes output while honoring cancellation of ctx. Implementers
