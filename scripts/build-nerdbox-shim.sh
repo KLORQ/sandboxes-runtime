@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the nerdbox shim with raw-virtio multi-layer support. The upstream
 # gptLayerThreshold=8 path produces a GPT VMDK that libkrun 1.19.6 rejects;
-# the patch keeps up to 128 plain EROFS layers on raw virtio disks.
+# the patch keeps up to 128 plain EROFS layers on raw virtio disks. The proxy
+# channel patch adds a guest-dialed vsock port bridged to a host unix socket.
 set -eu
 : "${NERDBOX_SRC:?set NERDBOX_SRC to an unpacked nerdbox v0.2.5 tree}"
 : "${OUT:?set OUT to the shim output path}"
@@ -12,6 +13,7 @@ cp -R "$NERDBOX_SRC" "$WORK/src"
 chmod -R u+w "$WORK/src"
 cd "$WORK/src"
 git apply "$ROOT/build/patches/nerdbox-gpt-threshold.patch"
+git apply "$ROOT/build/patches/nerdbox-proxy-channel.patch"
 CGO_ENABLED=1 \
 CGO_CFLAGS="-I${LIBKRUN_PREFIX:-/opt/homebrew/opt/libkrun}/include" \
 CGO_LDFLAGS="-L${LIBKRUN_PREFIX:-/opt/homebrew/opt/libkrun}/lib -lkrun" \
