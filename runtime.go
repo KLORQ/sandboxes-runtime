@@ -61,6 +61,10 @@ type Config struct {
 	FIFODir      string
 	Env          []string
 	Privileged   bool
+	// ProxyPort and ProxySocket request a guest-dialed vsock channel bridged
+	// to a host unix socket (see ADR-0002). Zero disables it.
+	ProxyPort   uint32
+	ProxySocket string
 }
 
 // Handle identifies a runtime instance.

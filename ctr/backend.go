@@ -87,6 +87,9 @@ func (b *Backend) Create(ctx context.Context, cfg runtime.Config) (runtime.Handl
 		Privileged:  cfg.Privileged,
 		Annotations: append([]string(nil), attachment.Annotations...),
 	}
+	if err := applyProxyChannel(&spec, cfg); err != nil {
+		return runtime.Handle{}, err
+	}
 	for _, volume := range cfg.BlockVolumes {
 		spec.Mounts = append(spec.Mounts, Mount{Type: "ext4", Source: volume.Source, Destination: volume.Destination})
 	}
@@ -123,6 +126,29 @@ func (b *Backend) cleanupFailedCreate(ctx context.Context, id string) error {
 		return fmt.Errorf("remove container after failed create: %w", err)
 	}
 	return nil
+}
+
+func applyProxyChannel(spec *RunSpec, cfg runtime.Config) error {
+	annotation, err := proxyChannelAnnotation(cfg)
+	if err != nil {
+		return err
+	}
+	if annotation != "" {
+		spec.Annotations = append(spec.Annotations, annotation)
+	}
+	return nil
+}
+
+// proxyChannelAnnotation renders the shim annotation for a guest-dialed
+// vsock channel or returns an empty string when the channel is disabled.
+func proxyChannelAnnotation(cfg runtime.Config) (string, error) {
+	if cfg.ProxyPort == 0 && cfg.ProxySocket == "" {
+		return "", nil
+	}
+	if cfg.ProxyPort < 1027 || cfg.ProxySocket == "" {
+		return "", errors.New("proxy channel requires a port >= 1027 and a socket path")
+	}
+	return fmt.Sprintf("io.klorq.proxy=port=%d,socket=%s", cfg.ProxyPort, cfg.ProxySocket), nil
 }
 
 // Handle returns the runtime handle for a sandbox name.
