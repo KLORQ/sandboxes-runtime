@@ -21,6 +21,7 @@ type Rule struct {
 	Protocol string
 	CIDR     string
 	Port     uint16
+	Domain   string
 }
 
 // Port maps a host loopback address/port to a guest port.

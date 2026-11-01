@@ -231,10 +231,10 @@ index 21ab61ee..3b1362c4 100644
  	apiToken, err := tokenauth.ReadToken(config.APITokenFile)
  	if err != nil {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index aeeb9766..eda8b388 100644
+index aeeb9766..e84ce225 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
-@@ -28,9 +28,10 @@ type upstreamResolver interface {
+@@ -28,9 +28,11 @@ type upstreamResolver interface {
  var validDNSChars = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
  
  type dnsHandler struct {
@@ -245,13 +245,18 @@ index aeeb9766..eda8b388 100644
 +	zonesLock     sync.RWMutex
 +	upstream      upstreamResolver
 +	allowUpstream bool
++	policy        *types.EgressPolicyHolder
  	// nameservers are the host's upstream DNS servers ("ip:port") used to
  	// forward raw queries for record types that Go's net.Resolver cannot
  	// look up directly (SOA, PTR, AAAA, CAA, ...).
-@@ -134,6 +135,10 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+@@ -134,6 +136,14 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
  		if done := h.addLocalAnswers(m, q); done {
  			return
  		}
++		if h.policy != nil && !h.policy.DNSAllowed(q.Name) {
++			m.Rcode = dns.RcodeRefused
++			return
++		}
 +		if !h.allowUpstream {
 +			m.Rcode = dns.RcodeRefused
 +			return
@@ -259,7 +264,17 @@ index aeeb9766..eda8b388 100644
  
  		resolver := h.upstream
  		switch q.Qtype {
-@@ -309,19 +314,28 @@ type Server struct {
+@@ -143,6 +153,9 @@ func (h *dnsHandler) addAnswers(m *dns.Msg) {
+ 				m.Rcode = dns.RcodeNameError
+ 				return
+ 			}
++			if h.policy != nil {
++				h.policy.RecordDNS(q.Name, ips)
++			}
+ 			for _, ip := range ips {
+ 				if len(ip.IP.To4()) != net.IPv4len {
+ 					continue
+@@ -309,23 +322,38 @@ type Server struct {
  	handler *dnsHandler
  }
  
@@ -295,6 +310,16 @@ index aeeb9766..eda8b388 100644
  	}
  	return &Server{udpConn: udpConn, tcpLn: tcpLn, handler: handler}, nil
  }
+ 
++// SetEgressPolicy attaches the host-enforced policy. It must be called before
++// the server starts serving queries.
++func (s *Server) SetEgressPolicy(policy *types.EgressPolicyHolder) {
++	s.handler.policy = policy
++}
++
+ func (s *Server) Serve() error {
+ 	mux := dns.NewServeMux()
+ 	mux.HandleFunc(".", s.handler.handleUDP)
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
 index 53b4f1e3..0dacf732 100644
 --- a/pkg/services/dns/dns_test.go
@@ -445,7 +470,7 @@ index 00000000..f720f19b
 +	}
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index 6a1f548a..19fc26d9 100644
+index 6a1f548a..3532b55c 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -7,6 +7,7 @@ import (
@@ -465,36 +490,22 @@ index 6a1f548a..19fc26d9 100644
  	if maxInFlight <= 0 {
  		maxInFlight = defaultTCPMaxInFlight
  	}
-@@ -31,13 +32,22 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
- 		connectTimeout = defaultTCPConnectTimeout
- 	}
- 	return tcp.NewForwarder(s, 0, maxInFlight, func(r *tcp.ForwarderRequest) {
--		localAddress := r.ID().LocalAddress
-+		guestAddress := r.ID().LocalAddress
- 
--		if (!ec2MetadataAccess) && linkLocal().Contains(localAddress) {
-+		if (!ec2MetadataAccess) && linkLocal().Contains(guestAddress) {
- 			r.Complete(true)
- 			return
+@@ -43,12 +44,26 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
  		}
- 
-+		// Evaluate policy against the guest-visible destination before NAT.
-+		// The host virtual IP is translated to loopback for dialing, but rules
-+		// and audit must describe the address the sandbox actually targeted.
-+		if !policy.Allows("tcp", guestAddress.String(), r.ID().LocalPort) {
-+			log.Debugf("egress policy denied tcp %s:%d revision=%s", guestAddress, r.ID().LocalPort, policy.Revision())
+ 		natLock.Unlock()
++		if !policy.Allows("tcp", localAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied tcp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
 +			r.Complete(true)
 +			return
 +		}
-+		localAddress := guestAddress
- 		natLock.Lock()
- 		if replaced, ok := nat[localAddress]; ok {
- 			localAddress = replaced
-@@ -49,6 +59,15 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
+ 		if err != nil {
+ 			log.Tracef("net.DialTimeout() = %v", err)
  			r.Complete(true)
  			return
  		}
-+		flowID := policy.Track("tcp", guestAddress.String(), r.ID().LocalPort, outbound)
++		flowID := policy.Track("tcp", localAddress.String(), r.ID().LocalPort, outbound)
 +		if flowID == 0 && policy.Enabled() {
 +			_ = outbound.Close()
 +			r.Complete(true)
@@ -507,7 +518,7 @@ index 6a1f548a..19fc26d9 100644
  		var wq waiter.Queue
  		ep, tcpErr := r.CreateEndpoint(&wq)
 diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
-index 12694496..4e8b440e 100644
+index 12694496..eb985d5d 100644
 --- a/pkg/services/forwarder/udp.go
 +++ b/pkg/services/forwarder/udp.go
 @@ -5,6 +5,7 @@ import (
@@ -518,35 +529,31 @@ index 12694496..4e8b440e 100644
  	log "github.com/sirupsen/logrus"
  	"gvisor.dev/gvisor/pkg/tcpip"
  	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
-@@ -14,14 +15,20 @@ import (
+@@ -14,7 +15,7 @@ import (
  	"gvisor.dev/gvisor/pkg/waiter"
  )
  
 -func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool) *udp.Forwarder {
 +func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mutex, ec2MetadataAccess bool, policy *types.EgressPolicyHolder) *udp.Forwarder {
  	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
--		localAddress := r.ID().LocalAddress
-+		guestAddress := r.ID().LocalAddress
+ 		localAddress := r.ID().LocalAddress
  
--		if (!ec2MetadataAccess) && linkLocal().Contains(localAddress) || (localAddress == header.IPv4Broadcast) {
-+		if (!ec2MetadataAccess) && linkLocal().Contains(guestAddress) || (guestAddress == header.IPv4Broadcast) {
- 			return true
+@@ -27,6 +28,10 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			localAddress = replaced
  		}
- 
-+		// Evaluate policy against the guest-visible destination before NAT.
-+		if !policy.Allows("udp", guestAddress.String(), r.ID().LocalPort) {
-+			log.Debugf("egress policy denied udp %s:%d revision=%s", guestAddress, r.ID().LocalPort, policy.Revision())
+ 		natLock.Unlock()
++		if !policy.Allows("udp", localAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied udp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
 +			return true
 +		}
-+		localAddress := guestAddress
- 		natLock.Lock()
- 		if replaced, ok := nat[localAddress]; ok {
- 			localAddress = replaced
-@@ -43,7 +50,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 
+ 		var wq waiter.Queue
+ 		ep, tcpErr := r.CreateEndpoint(&wq)
+@@ -43,7 +48,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
  		p, _ := NewUDPProxy(&autoStoppingListener{underlying: gonet.NewUDPConn(&wq, ep)}, func(_ net.Addr) (net.Conn, error) {
  			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
  		})
-+		flowID := policy.Track("udp", guestAddress.String(), r.ID().LocalPort, p)
++		flowID := policy.Track("udp", localAddress.String(), r.ID().LocalPort, p)
 +		if flowID == 0 && policy.Enabled() {
 +			_ = p.Close()
 +			return true
@@ -587,10 +594,10 @@ index 613b32a1..37964e24 100644
  type Protocol string
 diff --git a/pkg/types/egress_policy.go b/pkg/types/egress_policy.go
 new file mode 100644
-index 00000000..ba3415be
+index 00000000..a1db17ba
 --- /dev/null
 +++ b/pkg/types/egress_policy.go
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,662 @@
 +package types
 +
 +import (
@@ -599,6 +606,7 @@ index 00000000..ba3415be
 +	"io"
 +	"net"
 +	"os"
++	"regexp"
 +	"strings"
 +	"sync"
 +	"time"
@@ -612,6 +620,9 @@ index 00000000..ba3415be
 +	Protocol string `yaml:"protocol,omitempty" json:"protocol,omitempty"`
 +	CIDR     string `yaml:"cidr,omitempty" json:"cidr,omitempty"`
 +	Port     uint16 `yaml:"port,omitempty" json:"port,omitempty"`
++	// Domain is an exact name, *.example.com, **.example.com, or a
++	// single-label glob. It is mutually exclusive with CIDR.
++	Domain string `yaml:"domain,omitempty" json:"domain,omitempty"`
 +}
 +
 +// EgressPolicy is a host-enforced default-deny policy. Allow rules are
@@ -644,7 +655,9 @@ index 00000000..ba3415be
 +type compiledEgressRule struct {
 +	protocol string
 +	network  *net.IPNet
++	domain   *regexp.Regexp
 +	port     uint16
++	any      bool
 +	source   string
 +}
 +
@@ -655,10 +668,27 @@ index 00000000..ba3415be
 +	if r.port != 0 && r.port != port {
 +		return false
 +	}
-+	if r.network == nil {
++	if r.any {
 +		return true
 +	}
++	if r.network == nil {
++		return false
++	}
 +	return r.network.Contains(ip)
++}
++
++func (r compiledEgressRule) matchesDomain(protocol, name string, port uint16) bool {
++	if r.protocol != protocol || r.domain == nil {
++		return false
++	}
++	if r.port != 0 && r.port != port {
++		return false
++	}
++	return r.domain.MatchString(strings.TrimSuffix(strings.ToLower(name), "."))
++}
++
++func (r compiledEgressRule) matchesName(name string) bool {
++	return r.domain != nil && r.domain.MatchString(strings.TrimSuffix(strings.ToLower(name), "."))
 +}
 +
 +type egressSnapshot struct {
@@ -666,6 +696,12 @@ index 00000000..ba3415be
 +	sandboxID string
 +	allow     []compiledEgressRule
 +	deny      []compiledEgressRule
++	allowAny  bool
++}
++
++type resolvedBinding struct {
++	name    string
++	expires time.Time
 +}
 +
 +func (s *egressSnapshot) decide(protocol, address string, port uint16) (bool, string) {
@@ -697,29 +733,106 @@ index 00000000..ba3415be
 +			return nil, fmt.Errorf("%s rule %d: protocol must be tcp or udp, got %q", direction, i, rule.Protocol)
 +		}
 +		var network *net.IPNet
-+		if rule.CIDR == "" {
++		var domain *regexp.Regexp
++		switch {
++		case rule.CIDR != "" && rule.Domain != "":
++			return nil, fmt.Errorf("%s rule %d: cidr and domain are mutually exclusive", direction, i)
++		case rule.Domain != "":
++			parsed, err := compileDomainRule(rule.Domain)
++			if err != nil {
++				return nil, fmt.Errorf("%s rule %d: %w", direction, i, err)
++			}
++			domain = parsed
++		case rule.CIDR == "":
 +			if !allowAny || direction == "deny" {
 +				return nil, fmt.Errorf("%s rule %d: empty cidr is not allowed (set allowAny: true for an allow-all rule)", direction, i)
 +			}
-+		} else {
++		default:
 +			_, parsed, err := net.ParseCIDR(strings.TrimSpace(rule.CIDR))
 +			if err != nil {
 +				return nil, fmt.Errorf("%s rule %d: invalid cidr %q: %w", direction, i, rule.CIDR, err)
 +			}
 +			network = parsed
 +		}
++		any := rule.CIDR == "" && rule.Domain == ""
 +		source := fmt.Sprintf("%s %s port=%d", protocol, rule.CIDR, rule.Port)
-+		if rule.CIDR == "" {
++		if rule.Domain != "" {
++			source = fmt.Sprintf("%s domain=%s port=%d", protocol, rule.Domain, rule.Port)
++		} else if rule.CIDR == "" {
 +			source = fmt.Sprintf("%s any port=%d", protocol, rule.Port)
 +		}
 +		compiled = append(compiled, compiledEgressRule{
 +			protocol: protocol,
 +			network:  network,
++			domain:   domain,
 +			port:     rule.Port,
++			any:      any,
 +			source:   source,
 +		})
 +	}
 +	return compiled, nil
++}
++
++// compileDomainRule builds an anchored matcher. A single leading "*." matches
++// exactly one additional label; "**." matches one or more labels. Other glob
++// characters are restricted to one label so a pattern cannot unexpectedly
++// cross a dot boundary.
++func compileDomainRule(pattern string) (*regexp.Regexp, error) {
++	pattern = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(pattern), "."))
++	if pattern == "" || len(pattern) > 253 || strings.ContainsAny(pattern, "\\ ") {
++		return nil, fmt.Errorf("invalid domain %q", pattern)
++	}
++	var expression string
++	switch {
++	case strings.HasPrefix(pattern, "**."):
++		rest := pattern[3:]
++		if rest == "" || strings.Contains(rest, "*") {
++			return nil, fmt.Errorf("invalid domain %q", pattern)
++		}
++		expression = `^.+\.` + regexp.QuoteMeta(rest) + `$`
++	case strings.HasPrefix(pattern, "*."):
++		rest := pattern[2:]
++		if rest == "" || strings.Contains(rest, "*") {
++			return nil, fmt.Errorf("invalid domain %q", pattern)
++		}
++		expression = `^[^.]+\.` + regexp.QuoteMeta(rest) + `$`
++	default:
++		if strings.Contains(pattern, "*") {
++			return nil, fmt.Errorf("invalid domain %q", pattern)
++		}
++		expression = `^` + domainGlobExpression(pattern) + `$`
++	}
++	compiled, err := regexp.Compile(expression)
++	if err != nil {
++		return nil, fmt.Errorf("invalid domain %q: %w", pattern, err)
++	}
++	return compiled, nil
++}
++
++func domainGlobExpression(pattern string) string {
++	var b strings.Builder
++	for i := 0; i < len(pattern); i++ {
++		c := pattern[i]
++		switch c {
++		case '?':
++			b.WriteString(`[^.]`)
++		case '[':
++			end := strings.IndexByte(pattern[i+1:], ']')
++			if end < 0 {
++				b.WriteString(`\[`)
++				continue
++			}
++			class := pattern[i+1 : i+1+end]
++			if strings.HasPrefix(class, "!") {
++				class = "^" + class[1:]
++			}
++			b.WriteString("[" + class + "]")
++			i += end + 1
++		default:
++			b.WriteString(regexp.QuoteMeta(string(c)))
++		}
++	}
++	return b.String()
 +}
 +
 +func compileEgressPolicy(policy *EgressPolicy) (*egressSnapshot, error) {
@@ -740,6 +853,7 @@ index 00000000..ba3415be
 +		sandboxID: policy.SandboxID,
 +		allow:     allow,
 +		deny:      deny,
++		allowAny:  policy.AllowAny,
 +	}, nil
 +}
 +
@@ -812,10 +926,13 @@ index 00000000..ba3415be
 +	required   bool
 +	flows      map[uint64]trackedEgressFlow
 +	nextFlowID uint64
++	// resolved maps a DNS answer IP to the names that produced it. It is
++	// bounded and expires so a hostile resolver cannot grow it without limit.
++	resolved map[string][]resolvedBinding
 +}
 +
 +func NewEgressPolicyHolder(policy *EgressPolicy, required bool) (*EgressPolicyHolder, error) {
-+	holder := &EgressPolicyHolder{required: required, flows: make(map[uint64]trackedEgressFlow)}
++	holder := &EgressPolicyHolder{required: required, flows: make(map[uint64]trackedEgressFlow), resolved: make(map[string][]resolvedBinding)}
 +	if policy == nil {
 +		if required {
 +			return nil, fmt.Errorf("egress policy is required but not configured")
@@ -939,6 +1056,12 @@ index 00000000..ba3415be
 +		return 0
 +	}
 +	allowed, rule := snapshot.decide(protocol, address, port)
++	if !allowed && rule == "default-deny" {
++		if name, ok := h.resolvedNameLocked(protocol, address, port); ok {
++			allowed = true
++			rule = "allow:domain " + name
++		}
++	}
 +	if !allowed {
 +		audit := h.audit
 +		h.mu.Unlock()
@@ -982,16 +1105,23 @@ index 00000000..ba3415be
 +	h.mu.RLock()
 +	snapshot := h.snapshot
 +	audit := h.audit
-+	h.mu.RUnlock()
-+	if snapshot == nil {
-+		return true
++	allowed := true
++	rule := "no-policy"
++	if snapshot != nil {
++		allowed, rule = snapshot.decide(protocol, address, port)
++		if !allowed && rule == "default-deny" {
++			if name, ok := h.resolvedNameLocked(protocol, address, port); ok {
++				allowed = true
++				rule = "allow:domain " + name
++			}
++		}
 +	}
-+	allowed, rule := snapshot.decide(protocol, address, port)
++	h.mu.RUnlock()
 +	action := "deny"
 +	if allowed {
 +		action = "allow"
 +	}
-+	if audit != nil {
++	if snapshot != nil && audit != nil {
 +		// Audit failure must not change the enforcement decision; the
 +		// caller-facing decision is already computed and fail-closed.
 +		_ = audit.record(EgressDecision{
@@ -1005,6 +1135,113 @@ index 00000000..ba3415be
 +		})
 +	}
 +	return allowed
++}
++
++// DNSAllowed reports whether the guest may resolve name. CIDR rules need DNS
++// to map hostnames to their addresses, so any static allow also permits
++// resolution; domain-only policies permit only matching names.
++func (h *EgressPolicyHolder) DNSAllowed(name string) bool {
++	if h == nil {
++		return true
++	}
++	h.mu.RLock()
++	defer h.mu.RUnlock()
++	snapshot := h.snapshot
++	if snapshot == nil {
++		return true
++	}
++	normalized := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
++	for _, rule := range snapshot.deny {
++		if rule.matchesName(normalized) {
++			return false
++		}
++	}
++	for _, rule := range snapshot.allow {
++		if rule.matchesName(normalized) {
++			return true
++		}
++	}
++	if snapshot.allowAny {
++		return true
++	}
++	for _, rule := range snapshot.allow {
++		if rule.network != nil {
++			return true
++		}
++	}
++	return false
++}
++
++// RecordDNS remembers addresses returned for an authorized name. A bounded
++// ten-minute cache is consulted by Allows for domain-only rules.
++func (h *EgressPolicyHolder) RecordDNS(name string, addresses []net.IPAddr) {
++	if h == nil || len(addresses) == 0 || !h.DNSAllowed(name) {
++		return
++	}
++	normalized := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
++	now := time.Now()
++	h.mu.Lock()
++	defer h.mu.Unlock()
++	if h.snapshot == nil {
++		return
++	}
++	if h.resolved == nil {
++		h.resolved = make(map[string][]resolvedBinding)
++	}
++	if len(h.resolved) > 4096 {
++		h.resolved = make(map[string][]resolvedBinding)
++	}
++	for _, address := range addresses {
++		ip := address.IP
++		if ip == nil {
++			continue
++		}
++		key := ip.String()
++		bindings := h.resolved[key][:0]
++		for _, binding := range h.resolved[key] {
++			if binding.expires.After(now) && binding.name != normalized {
++				bindings = append(bindings, binding)
++			}
++		}
++		bindings = append(bindings, resolvedBinding{name: normalized, expires: now.Add(10 * time.Minute)})
++		if len(bindings) > 32 {
++			bindings = bindings[len(bindings)-32:]
++		}
++		h.resolved[key] = bindings
++	}
++}
++
++func (h *EgressPolicyHolder) resolvedNameLocked(protocol, address string, port uint16) (string, bool) {
++	ip := net.ParseIP(address)
++	if ip == nil {
++		return "", false
++	}
++	if v4 := ip.To4(); v4 != nil {
++		ip = v4
++	}
++	bindings := h.resolved[ip.String()]
++	if len(bindings) == 0 {
++		return "", false
++	}
++	now := time.Now()
++	snapshot := h.snapshot
++	for i := len(bindings) - 1; i >= 0; i-- {
++		binding := bindings[i]
++		if !binding.expires.After(now) {
++			continue
++		}
++		for _, rule := range snapshot.deny {
++			if rule.matchesDomain(protocol, binding.name, port) {
++				return "", false
++			}
++		}
++		for _, rule := range snapshot.allow {
++			if rule.matchesDomain(protocol, binding.name, port) {
++				return binding.name, true
++			}
++		}
++	}
++	return "", false
 +}
 +
 +func (h *EgressPolicyHolder) Close() error {
@@ -1025,13 +1262,14 @@ index 00000000..ba3415be
 +}
 diff --git a/pkg/types/egress_policy_test.go b/pkg/types/egress_policy_test.go
 new file mode 100644
-index 00000000..41bea302
+index 00000000..d9bee262
 --- /dev/null
 +++ b/pkg/types/egress_policy_test.go
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,324 @@
 +package types
 +
 +import (
++	"net"
 +	"os"
 +	"path/filepath"
 +	"strings"
@@ -1288,8 +1526,72 @@ index 00000000..41bea302
 +		t.Fatal("required holder must refuse removal")
 +	}
 +}
++
++func TestDomainPolicyRequiresDNSBinding(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision: "domains",
++		Allow: []EgressRule{
++			{Protocol: "tcp", Domain: "*.example.com", Port: 443},
++			{Protocol: "tcp", Domain: "**.internal.example", Port: 8443},
++			{Protocol: "tcp", Domain: "api[12].example.net", Port: 443},
++		},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if holder.Allows("tcp", "203.0.113.10", 443) {
++		t.Fatal("domain rule allowed an address before DNS")
++	}
++	if !holder.DNSAllowed("api.example.com") || !holder.DNSAllowed("a.b.internal.example") {
++		t.Fatal("allowed domain was refused DNS")
++	}
++	if holder.DNSAllowed("api.example.org") || holder.DNSAllowed("example.com") {
++		t.Fatal("non-matching domain was allowed DNS")
++	}
++	holder.RecordDNS("api.example.com", []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}})
++	if !holder.Allows("tcp", "203.0.113.10", 443) {
++		t.Fatal("resolved domain address was denied")
++	}
++	if holder.Allows("tcp", "203.0.113.10", 80) {
++		t.Fatal("port mismatch was allowed")
++	}
++	holder.RecordDNS("other.example.org", []net.IPAddr{{IP: net.ParseIP("203.0.113.11")}})
++	if holder.Allows("tcp", "203.0.113.11", 443) {
++		t.Fatal("unauthorized DNS answer was recorded")
++	}
++}
++
++func TestDomainDenyWins(t *testing.T) {
++	holder, err := NewEgressPolicyHolder(&EgressPolicy{
++		Revision: "deny",
++		Allow:    []EgressRule{{Protocol: "tcp", Domain: "**.example.com", Port: 443}},
++		Deny:     []EgressRule{{Protocol: "tcp", Domain: "secret.example.com", Port: 443}},
++	}, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if holder.DNSAllowed("secret.example.com") {
++		t.Fatal("denied domain allowed DNS")
++	}
++	holder.RecordDNS("secret.example.com", []net.IPAddr{{IP: net.ParseIP("203.0.113.12")}})
++	if holder.Allows("tcp", "203.0.113.12", 443) {
++		t.Fatal("denied domain allowed traffic")
++	}
++}
++
++func TestDomainRuleNeedsDomainOrCIDR(t *testing.T) {
++	for _, rule := range []EgressRule{
++		{Protocol: "tcp", CIDR: "192.0.2.0/24", Domain: "example.com"},
++		{Protocol: "tcp", Domain: "*"},
++		{Protocol: "tcp", Domain: "api.*.example.com"},
++	} {
++		if _, err := NewEgressPolicyHolder(&EgressPolicy{Allow: []EgressRule{rule}}, true); err == nil {
++			t.Fatalf("rule %+v accepted", rule)
++		}
++	}
++}
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index 3ed9a996..f9ca8250 100644
+index 3ed9a996..cd3c9012 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
 @@ -1,6 +1,7 @@
@@ -1324,7 +1626,7 @@ index 3ed9a996..f9ca8250 100644
 +	}
  
 -	dnsMux, err := dnsServer(configuration, s)
-+	dnsMux, err := dnsServer(configuration, s, !egressPolicy.Enabled())
++	dnsMux, err := dnsServer(configuration, s, !egressPolicy.Enabled(), egressPolicy)
  	if err != nil {
  		return nil, err
  	}
@@ -1333,11 +1635,11 @@ index 3ed9a996..f9ca8250 100644
  }
  
 -func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler, error) {
-+func dnsServer(configuration *types.Configuration, s *stack.Stack, allowUpstream bool) (http.Handler, error) {
++func dnsServer(configuration *types.Configuration, s *stack.Stack, allowUpstream bool, egressPolicy *types.EgressPolicyHolder) (http.Handler, error) {
  	udpConn, err := gonet.DialUDP(s, &tcpip.FullAddress{
  		NIC:  1,
  		Addr: tcpip.AddrFrom4Slice(net.ParseIP(configuration.GatewayIP).To4()),
-@@ -77,7 +80,18 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
+@@ -77,10 +80,22 @@ func dnsServer(configuration *types.Configuration, s *stack.Stack) (http.Handler
  		return nil, err
  	}
  
@@ -1357,6 +1659,10 @@ index 3ed9a996..f9ca8250 100644
  	if err != nil {
  		return nil, err
  	}
++	server.SetEgressPolicy(egressPolicy)
+ 
+ 	go func() {
+ 		if err := server.Serve(); err != nil {
 diff --git a/pkg/virtualnetwork/virtualnetwork.go b/pkg/virtualnetwork/virtualnetwork.go
 index b2b44614..5f4ac70d 100644
 --- a/pkg/virtualnetwork/virtualnetwork.go
