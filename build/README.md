@@ -27,8 +27,14 @@ tests are recorded in the plan:
   that upstream, follow bounded CNAME chains and expire bindings at the minimum
   observed TTL. Encrypted Client Hello on the
   domain-only path, domain-only UDP, and domain denies overlapping a direct IP
-  allow are rejected. HTTP Host and complete DNS-rebinding and bypass guarantees
-  are not established; the patch remains experimental.
+  allow are rejected. Policy decisions, audit records, and flow tracking use
+  the guest-visible destination evaluated before host NAT translation.
+  Live VM evidence (2026-11-01): default deny, allowed domain fetch with a
+  matching SNI, direct-IP connection without a matching name denied
+  (`tls-name-denied`), non-TLS on a domain-only rule denied, DNS refusal
+  after rule revocation, and reload revocation of active flows. HTTP Host
+  and complete DNS-rebinding and bypass guarantees are not established; the
+  patch remains experimental.
 - `patches/nerdbox-gpt-threshold.patch` — raises nerdbox's GPT threshold from
   8 to 128 layers so multi-layer images stay on raw virtio EROFS disks instead
   of the GPT VMDK path that libkrun 1.19.6 rejects. Build the shim with

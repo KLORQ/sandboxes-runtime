@@ -1,5 +1,5 @@
 diff --git a/cmd/gvproxy/config.go b/cmd/gvproxy/config.go
-index 16cbad4..0a99b9e 100644
+index 16cbad47..0a99b9e7 100644
 --- a/cmd/gvproxy/config.go
 +++ b/cmd/gvproxy/config.go
 @@ -24,31 +24,33 @@ const (
@@ -147,7 +147,7 @@ index 16cbad4..0a99b9e 100644
  	// Make sure the qemu socket provided is valid syntax
  	if config.Interfaces.Qemu != "" {
 diff --git a/cmd/gvproxy/main.go b/cmd/gvproxy/main.go
-index 21ab61e..3b1362c 100644
+index 21ab61ee..3b1362c4 100644
 --- a/cmd/gvproxy/main.go
 +++ b/cmd/gvproxy/main.go
 @@ -5,6 +5,7 @@ import (
@@ -231,7 +231,7 @@ index 21ab61e..3b1362c 100644
  	apiToken, err := tokenauth.ReadToken(config.APITokenFile)
  	if err != nil {
 diff --git a/pkg/services/dns/dns.go b/pkg/services/dns/dns.go
-index aeeb976..a447a92 100644
+index aeeb9766..a447a928 100644
 --- a/pkg/services/dns/dns.go
 +++ b/pkg/services/dns/dns.go
 @@ -28,9 +28,12 @@ type upstreamResolver interface {
@@ -331,7 +331,7 @@ index aeeb976..a447a92 100644
  	mux := dns.NewServeMux()
  	mux.HandleFunc(".", s.handler.handleUDP)
 diff --git a/pkg/services/dns/dns_test.go b/pkg/services/dns/dns_test.go
-index 53b4f1e..0dacf73 100644
+index 53b4f1e3..0dacf732 100644
 --- a/pkg/services/dns/dns_test.go
 +++ b/pkg/services/dns/dns_test.go
 @@ -199,7 +199,10 @@ var _ = ginkgo.Describe("dns add test", func() {
@@ -437,7 +437,7 @@ index 53b4f1e..0dacf73 100644
  	}, nil
 diff --git a/pkg/services/dns/egress_policy_test.go b/pkg/services/dns/egress_policy_test.go
 new file mode 100644
-index 0000000..f720f19
+index 00000000..f720f19b
 --- /dev/null
 +++ b/pkg/services/dns/egress_policy_test.go
 @@ -0,0 +1,38 @@
@@ -481,7 +481,7 @@ index 0000000..f720f19
 +}
 diff --git a/pkg/services/dns/policy_dns.go b/pkg/services/dns/policy_dns.go
 new file mode 100644
-index 0000000..b651e7c
+index 00000000..b651e7c3
 --- /dev/null
 +++ b/pkg/services/dns/policy_dns.go
 @@ -0,0 +1,191 @@
@@ -678,7 +678,7 @@ index 0000000..b651e7c
 +}
 diff --git a/pkg/services/dns/policy_dns_test.go b/pkg/services/dns/policy_dns_test.go
 new file mode 100644
-index 0000000..7a0fbde
+index 00000000..7a0fbde5
 --- /dev/null
 +++ b/pkg/services/dns/policy_dns_test.go
 @@ -0,0 +1,295 @@
@@ -979,7 +979,7 @@ index 0000000..7a0fbde
 +}
 diff --git a/pkg/services/forwarder/clienthello.go b/pkg/services/forwarder/clienthello.go
 new file mode 100644
-index 0000000..3c6a490
+index 00000000..3c6a490e
 --- /dev/null
 +++ b/pkg/services/forwarder/clienthello.go
 @@ -0,0 +1,75 @@
@@ -1060,7 +1060,7 @@ index 0000000..3c6a490
 +func (c *replayConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
 diff --git a/pkg/services/forwarder/clienthello_test.go b/pkg/services/forwarder/clienthello_test.go
 new file mode 100644
-index 0000000..ddaf742
+index 00000000..ddaf7429
 --- /dev/null
 +++ b/pkg/services/forwarder/clienthello_test.go
 @@ -0,0 +1,105 @@
@@ -1170,7 +1170,7 @@ index 0000000..ddaf742
 +	})
 +}
 diff --git a/pkg/services/forwarder/tcp.go b/pkg/services/forwarder/tcp.go
-index 6a1f548..2b5ffba 100644
+index 6a1f548a..8a71c65c 100644
 --- a/pkg/services/forwarder/tcp.go
 +++ b/pkg/services/forwarder/tcp.go
 @@ -1,12 +1,15 @@
@@ -1189,7 +1189,7 @@ index 6a1f548..2b5ffba 100644
  	"github.com/inetaf/tcpproxy"
  	log "github.com/sirupsen/logrus"
  	"gvisor.dev/gvisor/pkg/tcpip"
-@@ -23,15 +26,26 @@ const (
+@@ -23,52 +26,96 @@ const (
  	defaultTCPConnectTimeout = 30 * time.Second
  )
  
@@ -1217,16 +1217,23 @@ index 6a1f548..2b5ffba 100644
  
  		if (!ec2MetadataAccess) && linkLocal().Contains(localAddress) {
  			r.Complete(true)
-@@ -43,32 +57,62 @@ func TCP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			return
+ 		}
+ 
++		destAddress := localAddress
+ 		natLock.Lock()
+ 		if replaced, ok := nat[localAddress]; ok {
  			localAddress = replaced
  		}
  		natLock.Unlock()
 -		outbound, err := net.DialTimeout("tcp", net.JoinHostPort(localAddress.String(), fmt.Sprint(r.ID().LocalPort)), connectTimeout)
 -		if err != nil {
 -			log.Tracef("net.DialTimeout() = %v", err)
-+		direct, candidate := policy.TCPRoute(localAddress.String(), port)
++		// Policy decisions and audit use the guest-visible destination,
++		// before host NAT translation.
++		direct, candidate := policy.TCPRoute(destAddress.String(), port)
 +		if !direct && !candidate {
-+			policy.AuditTCP(localAddress.String(), port, false, "no-matching-rule")
++			policy.AuditTCP(destAddress.String(), port, false, "no-matching-rule")
  			r.Complete(true)
  			return
  		}
@@ -1250,8 +1257,8 @@ index 6a1f548..2b5ffba 100644
 +		if !direct {
 +			var err error
 +			name, prefix, err = readClientHello(guest, connectTimeout)
-+			if err != nil || !policy.AllowsDomain(localAddress.String(), port, name) {
-+				policy.AuditTCP(localAddress.String(), port, false, "tls-name-denied")
++			if err != nil || !policy.AllowsDomain(destAddress.String(), port, name) {
++				policy.AuditTCP(destAddress.String(), port, false, "tls-name-denied")
 +				return
  			}
 +		}
@@ -1263,16 +1270,16 @@ index 6a1f548..2b5ffba 100644
 +		defer outbound.Close()
 +		var flowID uint64
 +		if direct {
-+			flowID = policy.TrackDirect(localAddress.String(), port, outbound)
++			flowID = policy.TrackDirect(destAddress.String(), port, outbound)
 +		} else {
-+			flowID = policy.TrackDomain(localAddress.String(), port, name, outbound)
++			flowID = policy.TrackDomain(destAddress.String(), port, name, outbound)
 +		}
 +		if flowID == 0 && policy.Enabled() {
-+			policy.AuditTCP(localAddress.String(), port, false, "policy-changed")
++			policy.AuditTCP(destAddress.String(), port, false, "policy-changed")
 +			return
 +		}
 +		if flowID != 0 {
-+			policy.AuditTCP(localAddress.String(), port, true, "flow-allowed")
++			policy.AuditTCP(destAddress.String(), port, true, "flow-allowed")
 +			defer policy.Untrack(flowID)
 +		}
 +		var input net.Conn = guest
@@ -1292,10 +1299,10 @@ index 6a1f548..2b5ffba 100644
  
 diff --git a/pkg/services/forwarder/tcp_policy_test.go b/pkg/services/forwarder/tcp_policy_test.go
 new file mode 100644
-index 0000000..0c265cc
+index 00000000..7783b3cf
 --- /dev/null
 +++ b/pkg/services/forwarder/tcp_policy_test.go
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,197 @@
 +package forwarder
 +
 +import (
@@ -1369,7 +1376,7 @@ index 0000000..0c265cc
 +		t.Fatal(err)
 +	}
 +	defer holder.Close()
-+	holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}})
++	holder.RecordDNS("api.example.test", []net.IPAddr{{IP: net.ParseIP("198.51.100.42")}})
 +	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}, TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol}})
 +	defer s.Close()
 +	if e := s.CreateNIC(1, loopback.New()); e != nil {
@@ -1438,8 +1445,63 @@ index 0000000..0c265cc
 +		t.Fatal("revoked TLS was accepted")
 +	}
 +}
++
++// TestTCPPolicyEvaluatesBeforeNAT pins the M0 ordering: policy decisions and
++// audit must see the guest-visible destination, not the host-NAT translation.
++func TestTCPPolicyEvaluatesBeforeNAT(t *testing.T) {
++	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		_, _ = io.WriteString(w, "ok")
++	}))
++	defer backend.Close()
++	_, portString, err := net.SplitHostPort(backend.Listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	n, err := strconv.Atoi(portString)
++	if err != nil {
++		t.Fatal(err)
++	}
++	port := uint16(n) //nolint:gosec // n is checked above.
++	policy := &types.EgressPolicy{Revision: "1", Allow: []types.EgressRule{{Protocol: "tcp", CIDR: "198.51.100.42/32", Port: port}}}
++	holder, err := types.NewEgressPolicyHolder(policy, true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer holder.Close()
++	s := stack.New(stack.Options{NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol}, TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol}})
++	defer s.Close()
++	if e := s.CreateNIC(1, loopback.New()); e != nil {
++		t.Fatal(e)
++	}
++	source := tcpip.AddrFrom4([4]byte{10, 0, 2, 100})
++	if e := s.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: source.WithPrefix()}, stack.AddressProperties{}); e != nil {
++		t.Fatal(e)
++	}
++	s.SetSpoofing(1, true)
++	s.SetPromiscuousMode(1, true)
++	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
++	virtual := tcpip.AddrFrom4([4]byte{198, 51, 100, 42})
++	var mu sync.Mutex
++	fw := TCP(s, map[tcpip.Address]tcpip.Address{virtual: tcpip.AddrFrom4([4]byte{127, 0, 0, 1})}, &mu, false, 16, 2*time.Second, holder)
++	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fw.HandlePacket)
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	c, err := gonet.DialContextTCP(ctx, s, tcpip.FullAddress{NIC: 1, Addr: virtual, Port: port}, ipv4.ProtocolNumber)
++	if err != nil {
++		t.Fatalf("guest-visible CIDR rule must match before NAT: %v", err)
++	}
++	defer c.Close()
++	if e := holder.Update(&types.EgressPolicy{Revision: "2", Deny: []types.EgressRule{{Protocol: "tcp", CIDR: "198.51.100.42/32", Port: port}}}); e != nil {
++		t.Fatal(e)
++	}
++	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel2()
++	if _, err := gonet.DialContextTCP(ctx2, s, tcpip.FullAddress{NIC: 1, Addr: virtual, Port: port}, ipv4.ProtocolNumber); err == nil {
++		t.Fatal("guest-visible deny rule must reject before NAT")
++	}
++}
 diff --git a/pkg/services/forwarder/udp.go b/pkg/services/forwarder/udp.go
-index 1269449..eb985d5 100644
+index 12694496..cb804df4 100644
 --- a/pkg/services/forwarder/udp.go
 +++ b/pkg/services/forwarder/udp.go
 @@ -5,6 +5,7 @@ import (
@@ -1459,22 +1521,29 @@ index 1269449..eb985d5 100644
  	return udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
  		localAddress := r.ID().LocalAddress
  
-@@ -27,6 +28,10 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+@@ -22,11 +23,17 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+ 			return true
+ 		}
+ 
++		destAddress := localAddress
+ 		natLock.Lock()
+ 		if replaced, ok := nat[localAddress]; ok {
  			localAddress = replaced
  		}
  		natLock.Unlock()
-+		if !policy.Allows("udp", localAddress.String(), r.ID().LocalPort) {
-+			log.Debugf("egress policy denied udp %s:%d revision=%s", localAddress, r.ID().LocalPort, policy.Revision())
++		// Policy decisions use the guest-visible destination, before NAT.
++		if !policy.Allows("udp", destAddress.String(), r.ID().LocalPort) {
++			log.Debugf("egress policy denied udp %s:%d revision=%s", destAddress, r.ID().LocalPort, policy.Revision())
 +			return true
 +		}
  
  		var wq waiter.Queue
  		ep, tcpErr := r.CreateEndpoint(&wq)
-@@ -43,7 +48,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
+@@ -43,7 +50,15 @@ func UDP(s *stack.Stack, nat map[tcpip.Address]tcpip.Address, natLock *sync.Mute
  		p, _ := NewUDPProxy(&autoStoppingListener{underlying: gonet.NewUDPConn(&wq, ep)}, func(_ net.Addr) (net.Conn, error) {
  			return net.Dial("udp", net.JoinHostPort(localAddress.String(), strconv.Itoa(int(r.ID().LocalPort))))
  		})
-+		flowID := policy.Track("udp", localAddress.String(), r.ID().LocalPort, p)
++		flowID := policy.Track("udp", destAddress.String(), r.ID().LocalPort, p)
 +		if flowID == 0 && policy.Enabled() {
 +			_ = p.Close()
 +			return true
@@ -1487,7 +1556,7 @@ index 1269449..eb985d5 100644
  
  			// note that at this point packets that are sent to the current forwarder session
 diff --git a/pkg/types/configuration.go b/pkg/types/configuration.go
-index 613b32a..37964e2 100644
+index 613b32a1..37964e24 100644
 --- a/pkg/types/configuration.go
 +++ b/pkg/types/configuration.go
 @@ -34,6 +34,11 @@ type Configuration struct {
@@ -1515,7 +1584,7 @@ index 613b32a..37964e2 100644
  type Protocol string
 diff --git a/pkg/types/egress_policy.go b/pkg/types/egress_policy.go
 new file mode 100644
-index 0000000..6e19e7d
+index 00000000..6e19e7d3
 --- /dev/null
 +++ b/pkg/types/egress_policy.go
 @@ -0,0 +1,966 @@
@@ -2487,7 +2556,7 @@ index 0000000..6e19e7d
 +}
 diff --git a/pkg/types/egress_policy_test.go b/pkg/types/egress_policy_test.go
 new file mode 100644
-index 0000000..96f996d
+index 00000000..96f996d7
 --- /dev/null
 +++ b/pkg/types/egress_policy_test.go
 @@ -0,0 +1,534 @@
@@ -3026,7 +3095,7 @@ index 0000000..96f996d
 +	})
 +}
 diff --git a/pkg/virtualnetwork/services.go b/pkg/virtualnetwork/services.go
-index 3ed9a99..6bde7f7 100644
+index 3ed9a996..6bde7f73 100644
 --- a/pkg/virtualnetwork/services.go
 +++ b/pkg/virtualnetwork/services.go
 @@ -1,6 +1,7 @@
@@ -3102,7 +3171,7 @@ index 3ed9a99..6bde7f7 100644
  	go func() {
  		if err := server.Serve(); err != nil {
 diff --git a/pkg/virtualnetwork/virtualnetwork.go b/pkg/virtualnetwork/virtualnetwork.go
-index b2b4461..5f4ac70 100644
+index b2b44614..5f4ac70d 100644
 --- a/pkg/virtualnetwork/virtualnetwork.go
 +++ b/pkg/virtualnetwork/virtualnetwork.go
 @@ -30,6 +30,7 @@ type VirtualNetwork struct {
